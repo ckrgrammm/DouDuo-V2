@@ -3,6 +3,7 @@
 import SwiftUI
 import AVFoundation
 import MediaPlayer
+import CoreImage
 
 /// 全局播放登记表：App 进后台/失焦时由 App 层直接命令所有播放器停声，
 /// 比依赖视图的 onReceive 稳（视图可能还没渲染、或被 LazyVStack 回收）。
@@ -89,13 +90,104 @@ extension PlayerPage {
                          fillWidth: Bool = true, danmaku: [DYDanmaku] = [], altURL: URL? = nil,
                          quality: String? = nil, fastURL: URL? = nil, posterURL: URL? = nil,
                          videoAspect: Double = 0,
-                         headEndSeconds: Double? = nil, continuationURL: URL? = nil) -> PlayerPage {
-        PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
+                         headEndSeconds: Double? = nil, continuationURL: URL? = nil,
+                         onSwipeLeft: (() -> Void)? = nil, onSwipeRight: (() -> Void)? = nil,
+                         fillCropLimit: Double = 0.18) -> PlayerPage {
+        var page = PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
                    resumePosition: resumePosition, preparedPlayer: preparedPlayer, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
                    topInset: topInset, danmaku: danmaku, altURL: altURL, quality: quality, fastURL: fastURL,
                    posterURL: posterURL, headEndSeconds: headEndSeconds,
-                   continuationURL: continuationURL, videoAspect: videoAspect, title: title)
+                   continuationURL: continuationURL, videoAspect: videoAspect, title: title, onSwipeLeft: onSwipeLeft, onSwipeRight: onSwipeRight)
+        page.fillCropLimit = fillCropLimit
+        return page
+    }
+}
+
+// Low-resolution, cached still blur: no live-video filters or second player.
+final class DYVideoBackdropCache: @unchecked Sendable {
+    static let shared = DYVideoBackdropCache()
+    private let images = NSCache<NSURL, UIImage>()
+    private let worker = DispatchQueue(label: "douduo.backdrop", qos: .utility)
+    private let context = CIContext(options: [.useSoftwareRenderer: true])
+    init() { images.countLimit = 48; images.totalCostLimit = 4 * 1024 * 1024 }
+    func cached(_ url: URL) -> UIImage? { images.object(forKey: url as NSURL) }
+    func load(_ url: URL) async -> UIImage? {
+        if let hit = cached(url) { return hit }
+        guard let source = await ImageCache.shared.load(url) else { return nil }
+        return await withCheckedContinuation { continuation in
+            worker.async { [self] in
+                if let hit = cached(url) { continuation.resume(returning: hit); return }
+                let aspect = source.size.width / max(source.size.height, 1)
+                let size = aspect >= 1 ? CGSize(width: 128, height: 128 / max(aspect, 0.01))
+                    : CGSize(width: 128 * max(aspect, 0.01), height: 128)
+                let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
+                let small = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                    source.draw(in: CGRect(origin: .zero, size: size))
+                }
+                guard let input = CIImage(image: small),
+                      let output = CIFilter(name: "CIGaussianBlur", parameters: [kCIInputImageKey: input.clampedToExtent(), kCIInputRadiusKey: 12])?.outputImage,
+                      let cg = context.createCGImage(output, from: input.extent) else {
+                    continuation.resume(returning: small); return
+                }
+                let image = UIImage(cgImage: cg)
+                images.setObject(image, forKey: url as NSURL, cost: cg.bytesPerRow * cg.height)
+                continuation.resume(returning: image)
+            }
+        }
+    }
+}
+
+struct DYBlurredVideoBackdrop: View {
+    let url: URL?
+    @State private var image: UIImage?
+    init(url: URL?) {
+        self.url = url
+        _image = State(initialValue: url.flatMap { DYVideoBackdropCache.shared.cached($0) })
+    }
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                Color(white: 0.08)
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height).clipped()
+                }
+                Color.black.opacity(0.28)
+                LinearGradient(colors: [.black.opacity(0.36), .clear, .black.opacity(0.52)],
+                               startPoint: .top, endPoint: .bottom)
+                LinearGradient(colors: [.black.opacity(0.16), .clear, .black.opacity(0.16)],
+                               startPoint: .leading, endPoint: .trailing)
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false).accessibilityHidden(true)
+        .task(id: url) {
+            guard let url, let loaded = await DYVideoBackdropCache.shared.load(url), !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { image = loaded }
+        }
+    }
+}
+
+struct DYMediaViewport: ViewModifier {
+    let aspect: Double
+    let fillPortrait: Bool
+    /// 竖视频铺满时最多允许裁掉的宽/高比例；超过就完整显示（居中）。外屏放宽到 0.3，9:16 也能铺满
+    var maxCrop: Double = 0.18
+    static func mediaSize(aspect: Double, container: CGSize, fillPortrait: Bool, maxCrop: Double = 0.18) -> CGSize {
+        guard aspect.isFinite, aspect > 0, container.width > 0, container.height > 0 else { return container }
+        let screen = container.width / container.height
+        let crop = 1 - min(aspect, screen) / max(aspect, screen)
+        if fillPortrait && aspect < 1 && screen < 1 && crop <= maxCrop { return container }
+        return aspect > screen ? CGSize(width: container.width, height: container.width / aspect)
+            : CGSize(width: container.height * aspect, height: container.height)
+    }
+    func body(content: Content) -> some View {
+        GeometryReader { geo in
+            let size = Self.mediaSize(aspect: aspect, container: geo.size, fillPortrait: fillPortrait, maxCrop: maxCrop)
+            content.frame(width: size.width, height: size.height).clipped()
+                .position(x: geo.size.width / 2, y: geo.size.height / 2)
+        }
     }
 }
 
@@ -134,6 +226,10 @@ struct PlayerPage: View {
     var videoAspect: Double = 0
     /// 锁屏 / 控制中心「正在播放」上显示的标题
     var title: String = ""
+    var onSwipeLeft: (() -> Void)? = nil
+    var onSwipeRight: (() -> Void)? = nil
+    /// 竖视频铺满的裁切上限（见 DYMediaViewport.maxCrop）
+    var fillCropLimit: Double = 0.18
     /// 上一次刷新「正在播放」信息的位置（约每秒一次）
     @State private var lastNowPlaying = -10.0
     /// 静音（右下角按钮，全局记住）
@@ -165,6 +261,8 @@ struct PlayerPage: View {
     @State private var dmClock = DYDanmakuClock()
     @State private var timeToken: Any?
     @State private var endObserver: NSObjectProtocol?
+    /// 播放项直接失败（地址 403 / 解不开）就立刻换备用地址，不等 6 秒看门狗
+    @State private var failObserver: NSKeyValueObservation?
     @State private var barWidth: CGFloat = 1
     @State private var vlc: VLCPlayerController?        // AVPlayer 起播失败 → VLC 软解兜底
     @State private var avRetried = false
@@ -181,47 +279,50 @@ struct PlayerPage: View {
 
     var body: some View {
         ZStack {
-            Color.black
-            if let vlc {
-                // 画面铺到屏幕边缘（状态栏/底部安全区也盖住）：跟抖音原生一样，不留上下黑边
-                VLCPlayerSurface(controller: vlc, fillWidth: fillWidth).ignoresSafeArea()
-            } else if let player {
-                // 画面层真正有帧可显示（isReadyForDisplay）就撤掉封面：预加载 / 本地缓存的视频滑过来就是真画面，
-                // 不再「先闪一下封面再播」
-                ZStack {
-                    VideoSurface(player: player, fillWidth: fillWidth, onReady: { if !firstFrame { firstFrame = true } })
-                        .ignoresSafeArea()
-                    // 头部缓存接在线流：新播放器先叠在上面亮相（已缓冲、时间点对齐），再撤掉旧的，
-                    // 避免换 AVPlayerLayer 的 player 时断帧
-                    if let np = nextPlayer {
-                        VideoSurface(player: np, fillWidth: fillWidth)
-                            .ignoresSafeArea()
-                            .opacity(nextOpacity)
-                            .allowsHitTesting(false)
+            DYBlurredVideoBackdrop(url: posterURL)
+            ZStack {
+                if let vlc {
+                    // 画面铺到屏幕边缘（状态栏/底部安全区也盖住）：跟抖音原生一样，不留上下黑边
+                    VLCPlayerSurface(controller: vlc, fillWidth: fillWidth)
+                } else if let player {
+                    // 画面层真正有帧可显示（isReadyForDisplay）就撤掉封面：预加载 / 本地缓存的视频滑过来就是真画面，
+                    // 不再「先闪一下封面再播」
+                    ZStack {
+                        VideoSurface(player: player, fillWidth: fillWidth, onReady: { if !firstFrame { firstFrame = true } })
+                            
+                        // 头部缓存接在线流：新播放器先叠在上面亮相（已缓冲、时间点对齐），再撤掉旧的，
+                        // 避免换 AVPlayerLayer 的 player 时断帧
+                        if let np = nextPlayer {
+                            VideoSurface(player: np, fillWidth: fillWidth)
+                                
+                                .opacity(nextOpacity)
+                                .allowsHitTesting(false)
+                        }
                     }
+                } else {
+                    ProgressView().tint(.white)
                 }
-            } else {
-                ProgressView().tint(.white)
-            }
-            if vlc == nil, let hd = hdPlayer {
-                // 0.001 而不是 0：完全透明的层可能不出画面，换上来时会黑一下
-                VideoSurface(player: hd, fillWidth: fillWidth).ignoresSafeArea()
-                    .opacity(hdVisible ? 1 : 0.001).allowsHitTesting(false)
-            }
-            // 封面只给「还没缓存、还没出帧」的在线视频兜底；本地已缓存的直接等首帧（几十毫秒），不铺封面
-            if !firstFrame, !url.isFileURL, let posterURL {
-                GeometryReader { g in
-                    let screen = g.size.width / max(g.size.height, 1)
-                    let video = videoAspect > 0 ? videoAspect : screen
-                    let same = (video < 1) == (screen < 1)
-                    CachedAsyncImage(url: posterURL) { img in
-                        img.resizable().aspectRatio(contentMode: fillWidth && same ? .fill : .fit)
-                    } placeholder: { Color.clear }
-                    .frame(width: g.size.width, height: g.size.height)
+                if vlc == nil, let hd = hdPlayer {
+                    // 0.001 而不是 0：完全透明的层可能不出画面，换上来时会黑一下
+                    VideoSurface(player: hd, fillWidth: fillWidth)
+                        .opacity(hdVisible ? 1 : 0.001).allowsHitTesting(false)
                 }
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
+                // 封面只给「还没缓存、还没出帧」的在线视频兜底；本地已缓存的直接等首帧（几十毫秒），不铺封面
+                if !firstFrame, let posterURL {
+                    GeometryReader { g in
+                        let screen = g.size.width / max(g.size.height, 1)
+                        let video = videoAspect > 0 ? videoAspect : screen
+                        let same = (video < 1) == (screen < 1)
+                        CachedAsyncImage(url: posterURL) { img in
+                            img.resizable().aspectRatio(contentMode: fillWidth && same ? .fill : .fit)
+                        } placeholder: { Color.clear }
+                        .frame(width: g.size.width, height: g.size.height)
+                    }
+                        
+                        .allowsHitTesting(false)
+                }
             }
+            .modifier(DYMediaViewport(aspect: videoAspect, fillPortrait: fillWidth, maxCrop: fillCropLimit))
             if isActive && (!danmaku.isEmpty || dmStress) {
                 DYDanmakuLayer(items: danmaku, clock: dmClock, topInset: topInset)
             }
@@ -269,8 +370,11 @@ struct PlayerPage: View {
             player?.isMuted = m
             vlc?.mediaPlayer.audio?.isMuted = m
         }
+        // 推荐流指标：当前条首帧耗时（不是推荐页当前条的，DYFeedBench 自己忽略）
+        .onChange(of: firstFrame) { _, ready in if ready && isActive { DYFeedBench.firstFrame(id) } }
         .onChange(of: isActive) { _, active in
             if active { bindRemote() }
+            if active && firstFrame { DYFeedBench.firstFrame(id) }   // 预加载好的：一滑到就有画面
             if let v = vlc {
                 if active { v.mediaPlayer.audio?.isMuted = muted; v.mediaPlayer.play(); isPlaying = true }
                 else { v.mediaPlayer.pause(); isPlaying = false; onSavePosition(v.current) }
@@ -339,7 +443,9 @@ struct PlayerPage: View {
                     #endif
                 if seeking { seekTo(seekPreview); seeking = false; previewImage = nil }
             },
-            verticalFirst: true
+            verticalFirst: true,
+            onSwipeLeft: onSwipeLeft,
+            onSwipeRight: onSwipeRight
         )
     }
 
@@ -698,6 +804,7 @@ struct PlayerPage: View {
     private func detachObservers() {
         if let t = timeToken { player?.removeTimeObserver(t); timeToken = nil }
         if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
+        failObserver?.invalidate(); failObserver = nil
     }
 
     /// 起播看门狗：当前屏 6 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
@@ -706,8 +813,13 @@ struct PlayerPage: View {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
             let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
             guard stuck else { return }
-            if avRetried { startVLC() } else { avRetried = true; rebuild() }
+            recover()
         }
+    }
+
+    /// 起播失败的统一出路：先换备用地址重建一次，还不行交给 VLC
+    private func recover() {
+        if avRetried { startVLC() } else { avRetried = true; rebuild() }
     }
 
     private func rebuild() {
@@ -826,6 +938,16 @@ struct PlayerPage: View {
                         stalledTicks = 0
                     }
                 }
+            }
+        }
+        failObserver = p.currentItem?.observe(\.status, options: [.new]) { item, _ in
+            guard item.status == .failed else { return }
+            DispatchQueue.main.async {
+                guard isActive, isPlaying, player === p, vlc == nil else { return }
+                #if DEBUG
+                ddWrite("DDFAILFAST \(id) \(item.error?.localizedDescription ?? "-")")
+                #endif
+                recover()
             }
         }
         endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,

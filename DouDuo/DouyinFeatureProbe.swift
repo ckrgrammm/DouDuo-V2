@@ -8,7 +8,7 @@ enum DDFeatureProbe {
     /// 验证「只缓存前 N 秒」是否可行：AVFoundation 栈（CDN 对 URLSession 返回 403）
     static func exportHeadProbe(_ bridge: DouyinBridge) async {
         func log(_ s: String) { DYLiveModel.log("DDEXPORT " + s) }
-        guard let page = try? await bridge.fetchFeed(), let a = page.items.first(where: { $0.play != nil }),
+        guard let page = try? await bridge.fetchFeed(refresh: 1, pull: "0", tag: "probe"), let a = page.items.first(where: { $0.play != nil }),
               let s = a.play, let u = URL(string: s) else { log("no item"); return }
         let asset = DYMedia.asset(u)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else { log("no session"); return }

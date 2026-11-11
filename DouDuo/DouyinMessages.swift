@@ -699,19 +699,24 @@ struct DYMessagesScreen: View {
         if conversations != cache.snapshot.conversations { conversations = cache.snapshot.conversations }
         recent = cache.page(700)?.items ?? []
         DYLiveModel.log("DDMSGCACHE restore root=\(recent.count) chats=\(conversations.count) friends=\(friends.count)")
-        if let groups = try? await bridge.noticeCounts() {
+        // Independent reads start together after cached content has been restored.
+        async let refreshedCounts = bridge.noticeCounts()
+        async let refreshedRecent = cache.refresh(700, bridge: bridge)
+        async let refreshedFriends = missingFriends()
+        if let groups = try? await refreshedCounts {
             counts = Dictionary(groups.map { ($0.group, $0.count) }, uniquingKeysWith: { a, _ in a })
             cache.snapshot.counts = counts
         }
         do {
-            recent = try await cache.refresh(700, bridge: bridge).items
+            recent = try await refreshedRecent.items
             error = nil
         } catch {
             if recent.isEmpty { self.error = error.localizedDescription }
         }
+        let fetchedFriends = await refreshedFriends
         if !DYPeopleCache.shared.hasFriendsSnapshot {
             // 朋友没有增量游标：整份只取一次并落盘，之后进消息页不再重拉。
-            let fetched = (try? await bridge.followingUsers().items) ?? []
+            let fetched = fetchedFriends
             if !fetched.isEmpty {
                 DYPeopleCache.shared.mergeFriends(fetched, scope: cache.accountScope, complete: true)
                 friends = DYPeopleCache.shared.friends
@@ -721,6 +726,11 @@ struct DYMessagesScreen: View {
             friends = DYPeopleCache.shared.friends
         }
         cache.save()
+    }
+
+    private func missingFriends() async -> [DYFriend] {
+        guard !DYPeopleCache.shared.hasFriendsSnapshot else { return [] }
+        return (try? await bridge.followingUsers().items) ?? []
     }
 
     /// 点朋友头像：打开他的主页（网页版）
@@ -1378,8 +1388,9 @@ struct DYForwardScreen: View {
         .sheet(isPresented: $showLogin, onDismiss: { Task { await restorePeople() } }) { DYForwardOfficialScreen(item: item) }
         .sheet(isPresented: $showOtherApps) { DYForwardSystemShare(url: item.webURL) }
         .task { await restorePeople() }
-        .onAppear { DDPlayback.shared.pauseAll() }
+        .onAppear { model.panelVisible = true; DDPlayback.shared.pauseAll() }
         .onDisappear {
+            model.panelVisible = false
             // 缓存模型持有同一个只读官网上下文；下次打开无需重建SDK/重新拉整份朋友。
             if UIApplication.shared.applicationState == .active { DDPlayback.shared.resumeAll() }
         }
@@ -1450,6 +1461,7 @@ struct DYForwardOfficialScreen: View {
 /// 由官网已加载的分享组件处理选人、登录、签名与视频卡片协议；不拼造私信请求。
 @MainActor final class DYForwardWebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     static let cachedNative = DYForwardWebModel(nativeOnly: true)
+    @Published var panelVisible = false
     @Published private(set) var accountScope = ""
     @Published var message = "正在打开抖音官方分享面板…"
     @Published var loading = true
@@ -1466,6 +1478,8 @@ struct DYForwardOfficialScreen: View {
     private var bridgeFailed = false
     private var navigationGeneration = UUID()
     private var lastRemoteRefresh: Date?
+    private var preloadTarget: URL?
+    private var lastPreloadAttempt: Date?
     private var opening: Task<Void, Never>?
     init(nativeOnly: Bool = false) {
         self.nativeOnly = nativeOnly
@@ -1483,11 +1497,12 @@ struct DYForwardOfficialScreen: View {
         #endif
     }
 
-    func restorePeople(scope: String) {
+    func restorePeople(scope: String, refreshRemote: Bool = true) {
         if accountScope != scope {
             stop(); web?.navigationDelegate = nil; retainedWeb = nil; web = nil
             navigationGeneration = UUID(); accountScope = scope
             readyForSend = false; bridgeFailed = false; sending = false; lastRemoteRefresh = nil; expectedID = ""
+            preloadTarget = nil; lastPreloadAttempt = nil
         }
         let cache = DYPeopleCache.shared
         cache.activate(scope: scope)
@@ -1495,12 +1510,34 @@ struct DYForwardOfficialScreen: View {
         loading = !cache.hasContactsSnapshot
         message = cache.hasContactsSnapshot ? "已恢复朋友缓存，后台同步变化" : "正在加载分享联系人…"
         DYLiveModel.log("DDPEOPLE restore contacts=\(contacts.count) warm=\(retainedWeb != nil)")
-        if let web {
+        if refreshRemote, let web {
+            if web.isLoading { return }
             // 官网没有好友变更游标：温上下文仅本地差异扫描，最多每5分钟后台校准一次来源快照。
-            if lastRemoteRefresh.map({ Date().timeIntervalSince($0) >= 300 }) ?? true { web.reload() }
+            if DYForwardRefreshPolicy.shouldRefresh(lastUpdate: lastRemoteRefresh) { web.reload() }
             else { openPanel() }
         }
     }
+    /// Restore disk immediately at launch, then refresh once in the shared hidden context.
+    /// Changing the playing video does not request the contact list again.
+    func prepareContactPreload(item: DYAweme?) async -> URL? {
+        guard !layoutFixture, !sending, !panelVisible else { return nil }
+        await DYMessageCache.shared.prepare()
+        guard !Task.isCancelled else { return nil }
+        restorePeople(scope: DYMessageCache.shared.accountScope, refreshRemote: false)
+        if let existing = retainedWeb, let url = existing.url {
+            preloadTarget = url
+            if !existing.isLoading, DYForwardRefreshPolicy.shouldRefresh(lastUpdate: lastRemoteRefresh) {
+                existing.reload()
+            }
+            return url
+        }
+        guard let item else { return nil }
+        if let lastPreloadAttempt, Date().timeIntervalSince(lastPreloadAttempt) < 60 { return nil }
+        lastPreloadAttempt = Date()
+        preloadTarget = item.webURL
+        return item.webURL
+    }
+
     private struct Snapshot: Decodable {
         let state: String; let items: [DYForwardContact]
         let isDelta: Bool?; let removed: [String]?; let revision: String?
@@ -1606,6 +1643,11 @@ struct DYForwardOfficialScreen: View {
                            let bytes = json.data(using: .utf8), let snapshot = try? JSONDecoder().decode(Snapshot.self, from: bytes),
                            snapshot.state == "ready" || snapshot.state == "empty" {
                             guard !Task.isCancelled, self.navigationGeneration == generation, self.accountScope == account, self.expectedID == work else { return }
+                            #if DEBUG
+                            if let description = try? await web.callAsyncJavaScript("return JSON.stringify(window.__ddNativeForward.describe(expected));", arguments: ["expected": work], contentWorld: .page) as? String {
+                                print("DDFORWARD_PUBLIC_SCHEMA " + description)
+                            }
+                            #endif
                             let cache = DYPeopleCache.shared
                             guard cache.scope == account else { return }
                             if snapshot.isDelta == true, let removed = snapshot.removed, !removed.isEmpty {
@@ -1698,6 +1740,63 @@ struct DYForwardOfficialScreen: View {
       let peopleBaseline = new Map(), peopleHasBaseline = false, peopleSequence = 0, peoplePending = null;
       const peopleNonce = Date.now() + '-' + Math.random();
       window.__ddNativeForward = {
+        describe(expected) {
+          const snapshot = inspect(expected);
+          if (!snapshot.confirm) return {state: snapshot.state};
+          const store = snapshot.store;
+          const methods = {};
+          let object = store;
+          for (let i=0; i<3 && object; i++,object=Object.getPrototypeOf(object)) {
+            for (const key of Object.getOwnPropertyNames(object)) {
+              if (/share|message|text|confirm/i.test(key)) {
+                const value = store[key];
+                if (typeof value === 'function') methods[key] = String(value).slice(0,6000);
+              }
+            }
+          }
+          const chunks = Object.keys(window).filter(k => k.startsWith('webpackChunk'));
+          let runtime;
+          for (const name of chunks) {
+            try { window[name].push([[987654321], {}, r => { runtime = r; }]); } catch (_) {}
+            if (runtime) break;
+          }
+          const found = [];
+          for (const [id, module] of Object.entries(runtime?.c || {})) {
+            const exports = module?.exports;
+            const candidates = [exports];
+            try { candidates.push(...Object.values(exports || {})); } catch (_) {}
+            for (const value of candidates) {
+              if (value && typeof value.sendMessage === 'function' && typeof value.getConversationByIdWithOnlineAsync === 'function') {
+                found.push({id, source:String(value.sendMessage), keys:Object.keys(value)});
+                window.__ddShareSDK = value;
+              }
+            }
+            if (exports && typeof exports === 'object') {
+              for (const [key,value] of Object.entries(exports)) {
+                if (value && typeof value === 'object' && 'TEXT' in value && /SHARE/.test(Object.keys(value).join(',')))
+                  found.push({id,key,types:value});
+              }
+            }
+          }
+          for (const [id, factory] of Object.entries(runtime?.m || {})) {
+            const source = String(factory);
+            if (!(source.includes('getConversationByIdWithOnlineAsync') && source.includes('sendMessage')) &&
+                !(source.includes('SHARE_AWEME') && source.includes('TEXT'))) continue;
+            try {
+              const exports = runtime(id);
+              for (const [key,value] of Object.entries(exports || {})) {
+                if (value && typeof value.sendMessage === 'function' && typeof value.getConversationByIdWithOnlineAsync === 'function') {
+                  found.push({id,key,source:String(value.sendMessage).slice(0,16000),keys:Object.keys(value)});
+                  window.__ddShareSDK = value;
+                }
+                if (value && typeof value === 'object' && 'TEXT' in value && 'SHARE_AWEME' in value) {
+                  found.push({id,key,types:value}); window.__ddShareTypes = value;
+                }
+              }
+            } catch (_) {}
+          }
+          return {found};
+        },
         read(expected, incremental = false) {
           const snapshot = inspect(expected), items = [], seen = new Set();
           for (const user of snapshot.list || []) {
@@ -1784,6 +1883,50 @@ struct DYForwardOfficialScreen: View {
       return result(/登录后分享|扫码登录|登录其他账号/.test(text) ? 'login' : 'ready');
     })()
     """#
+}
+
+/// Contact data is account scoped and independent of whichever video is playing.
+enum DYForwardRefreshPolicy {
+    static func shouldRefresh(lastUpdate: Date?, now: Date = Date()) -> Bool {
+        guard let lastUpdate else { return true }
+        return now.timeIntervalSince(lastUpdate) >= 300
+    }
+}
+
+/// One host at the feed root, retained across video changes and handed to the share panel.
+struct DYForwardPreloadHost: View {
+    let item: DYAweme?
+    let enabled: Bool
+    @ObservedObject private var model = DYForwardWebModel.cachedNative
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var target: URL?
+
+    var body: some View {
+        Group {
+            if enabled, !model.panelVisible, let target {
+                DYForwardWebContainer(model: model, url: target)
+                    .frame(width: 760, height: 640)
+                    .frame(width: 1, height: 1).clipped().opacity(0.001)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+        }
+        .task(id: enabled && !model.panelVisible ? item?.id ?? "startup" : "") {
+            guard enabled, !model.panelVisible else { target = nil; return }
+            // The first usable video supplies the official share context. Keep it across swipes.
+            guard target == nil else { return }
+            let url = await model.prepareContactPreload(item: item)
+            guard !Task.isCancelled else { return }
+            target = url
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, enabled, !model.panelVisible else { return }
+            Task {
+                let url = await model.prepareContactPreload(item: item)
+                guard !Task.isCancelled, !model.panelVisible else { return }
+                target = url
+            }
+        }
+    }
 }
 
 private struct DYForwardWebContainer: UIViewRepresentable {

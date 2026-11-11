@@ -22,6 +22,9 @@ struct PlayerGestureView: UIViewRepresentable {
     var onEdgeEnded: (CGFloat, CGFloat, CGFloat) -> Void = { _, _, _ in }  // 松手：(位移, 横向速度, 屏宽)
     /// 竖向优先（抖音短视频：上下滑切视频是主操作，只有明显横向才算快进）；影库保持横向偏置
     var verticalFirst = false
+    /// Feed navigation takes left swipes; bottom progress-bar seeking stays independent.
+    var onSwipeLeft: (() -> Void)? = nil
+    var onSwipeRight: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -76,6 +79,7 @@ struct PlayerGestureView: UIViewRepresentable {
         weak var pan: UIPanGestureRecognizer?
         weak var edge: UIScreenEdgePanGestureRecognizer?
         weak var long: UILongPressGestureRecognizer?
+        private var navigationDirection: CGFloat = 0
         private var pressStartY: CGFloat = 0
         private var pressLocked = false
         private weak var frozenScroll: UIScrollView?
@@ -127,6 +131,17 @@ struct PlayerGestureView: UIViewRepresentable {
 
         @objc func handlePan(_ g: UIPanGestureRecognizer) {
             guard let v = view else { return }
+            if navigationDirection != 0 {
+                if g.state == .ended {
+                    let delta = g.translation(in: v)
+                    let threshold = max(60, min(120, v.bounds.width * 0.15))
+                    if delta.x * navigationDirection >= threshold, abs(delta.x) > abs(delta.y) * 1.2 {
+                        if navigationDirection < 0 { parent.onSwipeLeft?() } else { parent.onSwipeRight?() }
+                    }
+                }
+                if g.state == .ended || g.state == .cancelled || g.state == .failed { navigationDirection = 0 }
+                return
+            }
             switch g.state {
             case .began: parent.onSeekBegan()
             case .changed: parent.onSeekChanged(g.translation(in: v).x, v.bounds.width)
@@ -151,6 +166,8 @@ struct PlayerGestureView: UIViewRepresentable {
             var d = vel
             if abs(d.x) < 1, abs(d.y) < 1 { d = pg.translation(in: v) }
             if abs(d.x) < 0.5, abs(d.y) < 0.5 { return false }
+            navigationDirection = abs(d.x) > abs(d.y) * 1.2
+                ? (d.x < 0 && parent.onSwipeLeft != nil ? -1 : d.x > 0 && parent.onSwipeRight != nil ? 1 : 0) : 0
             if parent.verticalFirst {
                 // 横向要比竖向大 20% 才算快进，其余一律交给分页切视频
                 return abs(d.x) > abs(d.y) * 1.2

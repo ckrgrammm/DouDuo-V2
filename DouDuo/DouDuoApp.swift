@@ -80,6 +80,8 @@ struct DouDuoApp: App {
     @UIApplicationDelegateAdaptor(DouDuoAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
+    init() { DDPerf.mark("app.init") }
+
     var body: some Scene {
         WindowGroup {
             #if DEBUG

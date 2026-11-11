@@ -39,7 +39,7 @@ extension DouyinBridge {
     /// 关注 / 粉丝列表（offset 翻页，每页 20）
     func relationList(_ kind: DYRelationKind, uid: String, secUid: String, offset: Int) async throws -> (items: [DYRelationUser], cursor: Int, hasMore: Bool) {
         let js = kind == .following ? Self.relationFollowingJS : Self.relationFollowerJS
-        let d = try await call(js, args: ["uid": uid, "sec": secUid, "offset": String(offset)])
+        let d = try await cachedRead(js, args: ["uid": uid, "sec": secUid, "offset": String(offset)])
         let p = try JSONDecoder().decode(DYRelationPage.self, from: d)
         if p.code == 8 || (p.msg ?? "").contains("未登录") { throw DYError.bad("抖音未登录：右上「我的」→ 登录") }
         guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }

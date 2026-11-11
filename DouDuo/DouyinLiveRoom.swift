@@ -128,6 +128,7 @@ final class DYLiveModel: ObservableObject {
             if !rooms.contains(where: { $0.id == currentID }) { currentID = rooms.first?.id }
             fetchedAt = Date()
             error = rooms.isEmpty ? (zone == nil ? "暂时没有直播" : "这个分类暂时没有直播") : nil
+            DDPerf.mark("live.list")
             Self.log("DDLIVE_FEED count=\(r.count) elapsed=\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime - start))")
         } catch {
             guard requestGeneration == generation else { return }
@@ -352,13 +353,16 @@ struct DYLiveFeed: View {
             if value { stripExpanded = true; model.activate() } else { model.deactivate() }
         }
         .task {
-            if model.rooms.isEmpty || Date().timeIntervalSince(model.fetchedAt) > 60 {
-                await model.load(bridge, reset: true)
-            }
+            // Render and start the preloaded room immediately; refresh stale listings behind it.
             scrollID = model.currentID
             model.play(currentRoom)
-            // 并发拉取关注主播，不占用首播带宽也不阻塞起播
-            Task { await model.loadFollowLive(bridge) }
+            async let followed: Void = model.loadFollowLive(bridge)
+            if model.rooms.isEmpty || Date().timeIntervalSince(model.fetchedAt) > 60 {
+                await model.load(bridge, reset: true)
+                scrollID = model.currentID
+                model.play(currentRoom)
+            }
+            _ = await followed
         }
         .onChange(of: model.currentID) { old, id in
             if DYFollowLiveStripPolicy.shouldCollapse(old: old, new: id, expanded: stripExpanded) {

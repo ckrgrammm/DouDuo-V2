@@ -98,7 +98,7 @@ extension DouyinBridge {
     }
 
     func userPosts(_ sec: String, cursor: String) async throws -> (items: [DYAweme], cursor: String, hasMore: Bool) {
-        let d = try await call(Self.authorPostJS, args: ["sec": sec, "cursor": cursor], attempts: 1)
+        let d = try await cachedRead(Self.authorPostJS, args: ["sec": sec, "cursor": cursor], maxAge: cursor == "0" ? 180 : 30, attempts: 1)
         let p = try JSONDecoder().decode(DYMoreList.self, from: d)
         if p.code == 8 { throw DYError.bad("抖音未登录") }
         guard p.status == 200 else { throw DYError.blocked(p.msg ?? "HTTP \(p.status)") }
@@ -107,7 +107,7 @@ extension DouyinBridge {
 
     /// 只读关注状态，给按钮初值。不发关注。
     func followState(sec: String) async throws -> (followed: Bool, uid: String?) {
-        let d = try await call(Self.followReadJS, args: ["sec": sec], attempts: 1)
+        let d = try await cachedRead(Self.followReadJS, args: ["sec": sec], attempts: 1)
         let p = try JSONDecoder().decode(DYFollowRead.self, from: d)
         if p.code == 8 { throw DYError.bad("抖音未登录") }
         guard p.status == 200 else { throw DYError.blocked(p.msg ?? "HTTP \(p.status)") }
@@ -116,22 +116,22 @@ extension DouyinBridge {
 
     /// 关注 / 取消关注。只在按钮点击时调用，测试不要打这条。
     func followUser(_ uid: String, follow: Bool) async throws -> DYActionResult {
+        invalidateReadCache()
+        defer { invalidateReadCache() }
         let d = try await call(Self.followWriteJS, args: ["uid": uid, "type": follow ? "1" : "0"], attempts: 1)
         let r = try JSONDecoder().decode(DYFollowWrite.self, from: d)
         DYLiveModel.log("DDSEND follow uid=\(uid) type=\(follow ? 1 : 0) status=\(r.status) code=\(r.statusCode ?? -1) follow=\(r.followStatus ?? -1) msg=\(r.msg ?? "-")")
-        if r.status == 200, (r.statusCode ?? 0) == 0 { return .ok }
-        if r.statusCode == 8 || (r.msg ?? "").contains("未登录") { return .notLoggedIn }
-        return .failed(r.msg?.isEmpty == false ? r.msg! : "HTTP \(r.status) / code \(r.statusCode ?? -1)")
+        return Self.actionResult(status: r.status, code: r.statusCode, msg: r.msg)
     }
 
     /// 评论赞 / 取消赞。只在按钮点击时调用，测试不要打这条。
     func diggComment(_ cid: String, awemeID: String, like: Bool) async throws -> DYActionResult {
+        invalidateReadCache()
+        defer { invalidateReadCache() }
         let d = try await call(Self.commentDiggJS, args: ["cid": cid, "id": awemeID, "type": like ? "1" : "0"], attempts: 1)
         let r = try JSONDecoder().decode(DYActionResp.self, from: d)
         DYLiveModel.log("DDSEND comment-digg cid=\(cid) aweme=\(awemeID) digg_type=\(like ? 1 : 0) status=\(r.status) code=\(r.statusCode ?? -1) msg=\(r.msg ?? "-")")
-        if r.status == 200, (r.statusCode ?? 0) == 0 { return .ok }
-        if r.statusCode == 8 || (r.msg ?? "").contains("未登录") { return .notLoggedIn }
-        return .failed(r.msg?.isEmpty == false ? r.msg! : "HTTP \(r.status) / code \(r.statusCode ?? -1)")
+        return Self.actionResult(status: r.status, code: r.statusCode, msg: r.msg)
     }
 
     private static let noticeCountJS = #"""

@@ -9,3 +9,10 @@ Vendor/VLCKit/*.zip
 release.local.sh
 att*/
 *.xcresult/
+.env
+.env.*
+*.p12
+*.p8
+*.mobileprovision
+*.pem
+*.key

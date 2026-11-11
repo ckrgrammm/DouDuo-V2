@@ -194,7 +194,7 @@ open DouDuo.xcodeproj
 
 | 功能 | 接口 |
 | --- | --- |
-| 推荐 | `POST /aweme/v2/web/module/feed/` |
+| 推荐 | `GET /aweme/v1/web/tab/feed/`（网页版「推荐」页） |
 | 关注 | `/aweme/v1/web/follow/feed/` |
 | 搜索 / 联想 | `/aweme/v1/web/search/item/`、`/search/sug/` |
 | 评论 / 楼中楼 / 发评论 | `/comment/list/`、`/aweme/v2/web/comment/list/reply/`、`POST /comment/publish` |
