@@ -574,11 +574,33 @@ struct DYDanmakuClock {
 /// 抖音同款滚动弹幕：所有弹幕同一速度从右往左飘（同速 → 同一轨道里后面的永远追不上前面的）。
 /// 轨道按「前一条尾巴已经完全进屏 + 间距」分配，整条视频一次排好（布局只在弹幕列表 / 屏幕宽变化时重算）；
 /// 某个时刻所有轨道都满就丢掉这一条（抖音也是这样）。
+/// 机身温度状态。只给纯渲染节奏用（弹幕重绘帧率），不参与任何播放 / 数据逻辑。
+final class DDThermal: ObservableObject {
+    static let shared = DDThermal()
+    @Published private(set) var state = ProcessInfo.processInfo.thermalState
+    private init() {
+        NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.state = ProcessInfo.processInfo.thermalState
+        }
+    }
+    /// 弹幕重绘的最小帧间隔：常温跟屏幕刷新率（120Hz），发热后降到 60 / 30，
+    /// 把 GPU / 主线程让给视频解码。弹幕位置按时间算，降帧不影响时间轴。
+    var danmakuFrameInterval: Double? {
+        switch state {
+        case .nominal: return nil
+        case .fair: return 1.0 / 60
+        default: return 1.0 / 30
+        }
+    }
+}
+
 /// 位置用 TimelineView(.animation) 逐帧算（跟屏幕刷新率走，ProMotion 上 120Hz），不靠 SwiftUI 补间动画。
 struct DYDanmakuLayer: View {
     let items: [DYDanmaku]
     let clock: DYDanmakuClock
     let topInset: CGFloat
+    @ObservedObject private var thermal = DDThermal.shared
     @AppStorage(DYDanmakuPolicy.densityKey) private var densityRaw = DYDanmakuPolicy.Density.standard.rawValue
     @AppStorage(DYDanmakuPolicy.deduplicateKey) private var deduplicate = true
 
@@ -599,12 +621,15 @@ struct DYDanmakuLayer: View {
             let speed = (w + 200) / 7
             let placed = DYDanmakuLayout.shared.get(renderItems, w: w, lanes: region.lanes, speed: speed,
                                                   density: density, deduplicate: deduplicate)
-            TimelineView(.animation(minimumInterval: nil, paused: !clock.playing)) { ctx in
+            TimelineView(.animation(minimumInterval: thermal.danmakuFrameInterval, paused: !clock.playing)) { ctx in
                 let t = clock.now(ctx.date)
+                // 只把此刻在屏幕上的那几条交给 Canvas：整条视频的弹幕可能有几百条，
+                // 以前每一帧都要把全部条目当作 symbol 过一遍 diff。
+                let visible = placed.filter { t >= $0.d.offset && t <= $0.d.offset + $0.dur }
                 Canvas(rendersAsynchronously: false) { gc, _ in
                     var regionContext = gc
                     regionContext.clip(to: Path(CGRect(x: 0, y: region.top, width: w, height: max(0, region.bottom - region.top))))
-                    for p in placed where t >= p.d.offset && t <= p.d.offset + p.dur {
+                    for p in visible {
                         let x = w - CGFloat(t - p.d.offset) * speed
                         let y = region.top + CGFloat(p.lane) * DYDanmakuPolicy.laneHeight
                         guard let sym = regionContext.resolveSymbol(id: p.d.id) else { continue }
@@ -612,7 +637,7 @@ struct DYDanmakuLayer: View {
                     }
                 } symbols: {
                     // 只排版一次，逐帧移动贴图；区域外再裁剪，避免遮挡下方内容。
-                    ForEach(placed, id: \.d.id) { p in
+                    ForEach(visible, id: \.d.id) { p in
                         Text(p.d.text)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.92))
@@ -821,7 +846,7 @@ struct DYListPlayer: View {
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
                 // 外屏：评论面板从底部升起，视频缩到上方继续播
-                DYCommentDock(enabled: layout.docked, isOpen: $showComments) {
+                DYCommentDock(panelID: currentID, enabled: layout.docked, isOpen: $showComments) {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(items) { item in
@@ -876,7 +901,7 @@ struct DYListPlayer: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
-            .animation(.snappy, value: showComments)
+            .animation(layout.docked ? nil : .snappy, value: showComments)
             .animation(.snappy, value: layout.fold)
         }
         .ignoresSafeArea()
@@ -1647,6 +1672,8 @@ struct DYFollowFeed: View {
     let onLogin: () -> Void
     let onToast: (String) -> Void
     var onLive: (DYLiveRoom) -> Void = { _ in }
+    /// 关注流手指往左滑回推荐（推荐在关注右边）
+    var onSwipeToRecommend: (() -> Void)? = nil
     @Environment(\.horizontalSizeClass) private var hSize
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
@@ -1662,7 +1689,7 @@ struct DYFollowFeed: View {
             let layout = DYCommentLayout(size: geo.size, fold: DYDuoMetrics.foldIsActive(geo), showComments: showComments)
             ZStack(alignment: .topLeading) {
             // 外屏：评论面板从底部升起，视频缩到上方继续播
-            DYCommentDock(enabled: layout.docked && !m.items.isEmpty, isOpen: $showComments) {
+            DYCommentDock(panelID: currentID, enabled: layout.docked && !m.items.isEmpty, isOpen: $showComments) {
             Group {
             if m.items.isEmpty {
                 VStack(spacing: 12) {
@@ -1693,6 +1720,7 @@ struct DYFollowFeed: View {
                                         onSearch: {},
                                         onAuthor: { onAuthor(item) }, onSavePosition: { resume[item.id] = $0 },
                                         preloader: preloader, bridge: bridge, onToast: onToast,
+                                        onSwipeLeftOverride: onSwipeToRecommend,
                                         onSwipeRightOverride: showComments ? { withAnimation(.snappy) { showComments = false } } : nil)
                                 .frame(width: layout.videoWidth, height: layout.videoHeight)
                                 .clipped()
@@ -1725,7 +1753,7 @@ struct DYFollowFeed: View {
                     .id(cur.id)
             }
             }
-            .animation(.snappy, value: showComments)
+            .animation(layout.docked ? nil : .snappy, value: showComments)
             .animation(.snappy, value: layout.fold)
         }
         .task {

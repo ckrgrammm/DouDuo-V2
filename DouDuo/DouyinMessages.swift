@@ -1317,7 +1317,9 @@ struct DYForwardScreen: View {
     @Environment(\.colorScheme) private var scheme
     @StateObject private var model = DYForwardWebModel.cachedNative
     @State private var accountPrepared = false
-    @State private var selected: DYForwardContact?
+    /// 多选：按点选顺序依次发送，官网组件一次只接受一个收件人。
+    @State private var picked: [DYForwardContact] = []
+    @State private var confirming = false
     @State private var showContacts = false
     @State private var groupsOnly = false
     @State private var query = ""
@@ -1334,6 +1336,8 @@ struct DYForwardScreen: View {
         else if !model.loading && model.contacts.isEmpty { result.append(.init(id: "retry", title: "重新加载", symbol: "arrow.clockwise")) }
         return result
     }
+    /// 启动预加载已按账号恢复过朋友缓存：面板直接显示，不等 cookie 校验（校验在后台做，账号变了会自动清空重载）。
+    private var prepared: Bool { accountPrepared || !model.accountScope.isEmpty }
     private var visibleContacts: [DYForwardContact] {
         model.contacts.filter { (!groupsOnly || $0.kind == 2) && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }
     }
@@ -1342,13 +1346,14 @@ struct DYForwardScreen: View {
             ZStack {
                 theme.media.strongScrim.color(for: scheme).opacity(0.24).ignoresSafeArea()
                     .onTapGesture { if !model.sending { dismiss() } }
-                DYNativeForwardPanel(contacts: accountPrepared ? model.contacts : [], loading: !accountPrepared || model.loading || model.sending,
-                                     status: accountPrepared ? model.message : "正在恢复朋友缓存…", actions: accountPrepared ? actions : [],
-                                     onContact: { if !model.sending { selected = $0 } },
+                DYNativeForwardPanel(contacts: prepared ? model.contacts : [], loading: !prepared || model.loading || model.sending,
+                                     status: prepared ? model.message : "正在恢复朋友缓存…", actions: prepared ? actions : [],
+                                     selected: Set(picked.map(\.id)), onSend: { if !model.sending && !picked.isEmpty { confirming = true } },
+                                     onContact: { if !model.sending { toggle($0) } },
                                      onAction: perform, onClose: { if !model.sending { dismiss() } })
                     .frame(width: max(0, min(560, geo.size.width - 32)))
                 // 挂载真实官方分享组件，保留React事件与鉴权，但不让网页进入用户界面或无障碍树。
-                if accountPrepared && !model.layoutFixture {
+                if prepared && !model.layoutFixture {
                     DYForwardWebContainer(model: model, url: item.webURL)
                         .id(model.accountScope)
                         .frame(width: 760, height: 640)
@@ -1359,48 +1364,62 @@ struct DYForwardScreen: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .interactiveDismissDisabled(model.sending)
-        .alert("确认转发", isPresented: Binding(get: { selected != nil }, set: { if !$0 { selected = nil } })) {
-            if let target = selected {
-                Button("发送") { selected = nil; Task { await model.send(to: target, itemURL: item.webURL) } }
-                Button("取消", role: .cancel) { selected = nil }
-            }
-        } message: { Text("将当前作品发送给“\(selected?.name ?? "")”？") }
+        .alert("确认转发", isPresented: $confirming) {
+            Button("发送") { let targets = picked; picked = []; Task { await model.send(to: targets, itemURL: item.webURL) } }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(picked.count == 1 ? "将当前作品发送给“\(picked.first?.name ?? "")”？"
+                 : "将当前作品依次发送给 \(picked.count) 人：\(picked.map(\.name).joined(separator: "、"))？")
+        }
         .sheet(isPresented: $showContacts) {
             NavigationStack {
                 List(visibleContacts) { contact in
-                    Button {
-                        showContacts = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { selected = contact }
-                    } label: {
+                    Button { toggle(contact) } label: {
                         HStack {
                             CachedAsyncImage(url: contact.avatar.flatMap(URL.init(string:))) { $0.resizable().scaledToFill() }
                                 placeholder: { Image(systemName: contact.kind == 2 ? "person.2.circle" : "person.circle") }
                                 .frame(width: 44, height: 44).clipShape(Circle())
                             Text(contact.name).foregroundStyle(.themeTextPrimary)
+                            Spacer(minLength: 0)
+                            let on = picked.contains { $0.id == contact.id }
+                            Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                                .font(.title3).foregroundStyle(on ? Color.accentColor : Color(uiColor: .tertiaryLabel))
+                                .accessibilityHidden(true)
                         }
                     }
+                    .accessibilityAddTraits(picked.contains { $0.id == contact.id } ? .isSelected : [])
                 }
                 .searchable(text: $query, prompt: "搜索已加载的朋友或群")
                 .navigationTitle(groupsOnly ? "选择群聊" : "选择朋友")
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { showContacts = false } } }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("关闭") { showContacts = false } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(picked.isEmpty ? "发送" : "发送(\(picked.count))") {
+                            showContacts = false
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { if !picked.isEmpty { confirming = true } }
+                        }
+                        .disabled(picked.isEmpty)
+                    }
+                }
             }
         }
         .sheet(isPresented: $showLogin, onDismiss: { Task { await restorePeople() } }) { DYForwardOfficialScreen(item: item) }
         .sheet(isPresented: $showOtherApps) { DYForwardSystemShare(url: item.webURL) }
         .task { await restorePeople() }
-        .onAppear { model.panelVisible = true; DDPlayback.shared.pauseAll() }
-        .onDisappear {
-            model.panelVisible = false
-            // 缓存模型持有同一个只读官网上下文；下次打开无需重建SDK/重新拉整份朋友。
-            if UIApplication.shared.applicationState == .active { DDPlayback.shared.resumeAll() }
-        }
+        // 分享浮层不暂停视频：缓存模型持有同一个只读官网上下文，下次打开无需重建SDK/重新拉整份朋友。
+        .onAppear { model.panelVisible = true }
+        .onDisappear { model.panelVisible = false }
     }
     private func restorePeople() async {
         if model.layoutFixture { accountPrepared = true; return }
-        accountPrepared = false
         await DYMessageCache.shared.prepare()
         model.restorePeople(scope: DYMessageCache.shared.accountScope)
         accountPrepared = true
+    }
+    private func toggle(_ contact: DYForwardContact) {
+        if let index = picked.firstIndex(where: { $0.id == contact.id }) { picked.remove(at: index) }
+        else if picked.count < DYForwardWebModel.maxRecipients { picked.append(contact) }
+        else { model.message = "一次最多选择 \(DYForwardWebModel.maxRecipients) 个" }
     }
     private func perform(_ action: String) {
         guard !model.sending else { return }
@@ -1542,48 +1561,89 @@ struct DYForwardOfficialScreen: View {
         let state: String; let items: [DYForwardContact]
         let isDelta: Bool?; let removed: [String]?; let revision: String?
     }
-    func send(to contact: DYForwardContact, itemURL: URL) async {
+    static let maxRecipients = 9
+    /// 官网ShareeList一次只确认一个收件人：多选按顺序逐个发送，未确认的不自动重发。
+    func send(to requested: [DYForwardContact], itemURL: URL) async {
         guard !layoutFixture else { message = "合成布局测试：未发送任何消息"; return }
-        guard !sending, contacts.contains(where: { $0.id == contact.id }) else { return }
+        let targets = requested.filter { row in contacts.contains { $0.id == row.id } }.prefix(Self.maxRecipients)
+        guard !sending, !targets.isEmpty else { return }
         let account = accountScope, target = itemURL.lastPathComponent
         sending = true; message = "正在准备转发…"
         defer { if accountScope == account { sending = false } }
+        var sent: [String] = [], unconfirmed: [String] = [], rejected: [String] = [], skipped: [String] = []
+        var blocked: String?
+        for (index, contact) in targets.enumerated() {
+            guard !Task.isCancelled, accountScope == account else { return }
+            if blocked != nil { skipped.append(contact.name); continue }
+            if index > 0 { try? await Task.sleep(for: .milliseconds(600)) }
+            let progress = targets.count > 1 ? "（\(index + 1)/\(targets.count)）" : ""
+            guard var state = await sendOne(contact, itemURL: itemURL, account: account, target: target, progress: progress) else { return }
+            if state == "not-ready" {
+                // 官网发完一条可能收起分享面板：此时尚未发送，重新打开后只重试这一次。
+                readyForSend = false; openPanel()
+                guard let retried = await sendOne(contact, itemURL: itemURL, account: account, target: target, progress: progress) else { return }
+                state = retried
+            }
+            switch state {
+            case "sent": sent.append(contact.name)
+            case "rejected": rejected.append(contact.name)
+            case "login", "bridge-not-ready", "not-ready", "wrong-work": blocked = state; skipped.append(contact.name)
+            case "missing-recipient": skipped.append(contact.name)
+            default: unconfirmed.append(contact.name)
+            }
+        }
+        guard accountScope == account else { return }
+        if targets.count == 1, let name = targets.first?.name {
+            if !sent.isEmpty { message = "已转发给“\(name)”" }
+            else if !rejected.isEmpty { message = "抖音未接受本次转发，请到消息中核对" }
+            else if blocked == "login" { message = "请先登录抖音，尚未发送" }
+            else if blocked == "bridge-not-ready" { message = "转发组件尚未就绪，尚未发送，请稍后重试" }
+            else if !skipped.isEmpty { message = "当前作品或朋友列表已变化，请重新打开转发" }
+            else { message = "发送未确认，请到抖音消息核对，勿重复发送" }
+            return
+        }
+        var parts = ["已转发 \(sent.count)/\(targets.count) 人"]
+        if !unconfirmed.isEmpty { parts.append("未确认：\(unconfirmed.joined(separator: "、"))（请到抖音消息核对，勿重复发送）") }
+        if !rejected.isEmpty { parts.append("抖音未接受：\(rejected.joined(separator: "、"))") }
+        if !skipped.isEmpty {
+            let reason = blocked == "login" ? "需先登录抖音" : blocked == nil ? "朋友列表已变化" : "转发组件未就绪"
+            parts.append("尚未发送：\(skipped.joined(separator: "、"))（\(reason)）")
+        }
+        message = parts.joined(separator: "；")
+    }
+    /// 返回nil表示账号或作品已切换，整批作废；其余为单个收件人的结果状态。
+    private func sendOne(_ contact: DYForwardContact, itemURL: URL, account: String, target: String, progress: String) async -> String? {
         let deadline = Date().addingTimeInterval(40)
         while web == nil && Date() < deadline {
-            guard !Task.isCancelled, accountScope == account else { return }
+            guard !Task.isCancelled, accountScope == account else { return nil }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        guard let web, accountScope == account else { return }
+        guard let web, accountScope == account else { return nil }
         if expectedID != target || web.url?.path != itemURL.path {
             readyForSend = false; bridgeFailed = false; loginRequired = false; expectedID = target
             web.load(URLRequest(url: itemURL))
         }
         while !readyForSend && Date() < deadline && !loginRequired && !bridgeFailed {
-            guard !Task.isCancelled, accountScope == account, expectedID == target else { return }
+            guard !Task.isCancelled, accountScope == account, expectedID == target else { return nil }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        guard accountScope == account, expectedID == target else { return }
-        guard readyForSend else { message = loginRequired ? "请先登录抖音，尚未发送" : "转发组件尚未就绪，尚未发送，请稍后重试"; return }
-        message = "正在转发…"
+        guard accountScope == account, expectedID == target else { return nil }
+        guard readyForSend else { return loginRequired ? "login" : "bridge-not-ready" }
+        message = "正在转发\(progress)…"
         do {
             let raw = try await web.callAsyncJavaScript(
                 "return JSON.stringify(await window.__ddNativeForward.send(expected, recipient));",
                 arguments: ["expected": expectedID, "recipient": contact.id], contentWorld: .page) as? String
-            guard accountScope == account, expectedID == target else { return }
+            guard accountScope == account, expectedID == target else { return nil }
             let data = raw?.data(using: .utf8)
             let response = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
-            switch response?["state"] {
-            case "sent": message = "已转发给“\(contact.name)”"
-            case "rejected": message = "抖音未接受本次转发，请到消息中核对"
-            case "not-ready", "wrong-work", "missing-recipient": message = "当前作品或朋友列表已变化，请重新打开转发"
-            default: message = "发送未确认，请到抖音消息核对，勿重复发送"
-            }
             DYLiveModel.log("DDFORWARD send=\(response?["state"] ?? "unconfirmed") source=\(response?["source"] ?? "unknown") elapsed_ms=\(response?["elapsed_ms"] ?? "unknown")")
+            return response?["state"] ?? "unconfirmed"
         } catch {
-            guard accountScope == account, expectedID == target else { return }
-            message = "发送未确认，请到抖音消息核对，勿重复发送"
+            guard accountScope == account, expectedID == target else { return nil }
             let failure = error as NSError
             DYLiveModel.log("DDFORWARD send=unconfirmed source=webkit code=\(failure.code)")
+            return "unconfirmed"
         }
     }
 

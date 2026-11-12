@@ -1,8 +1,9 @@
-// 推荐流供应管线：4-Worker Feed Pipeline + Shared Video Pool。
+// 推荐流供应管线：Feed Pipeline + Shared Video Pool。
 //
-// - 一个 actor（DYFeedCoordinator）独占全部共享状态：请求序号 / refresh_index、在途请求、乱序结果缓冲、
-//   候选池（DYSharedVideoPool）、退避与限速。Worker 只负责「拿着票去请求」，不碰 refresh_index，
-//   也不碰 UI 播放列表；结果交回 coordinator，按序号顺序合并进候选池，再由 UI 那边统一从池子里取。
+// - 一个 actor（DYFeedCoordinator）独占全部共享状态：请求序号 / refresh_index、在途请求、
+//   候选池（DYSharedVideoPool）、退避与限速。请求方只负责「拿着票去请求」，不碰 refresh_index，
+//   也不碰 UI 播放列表；结果交回 coordinator，先到先合并进候选池，再由 UI 那边统一从池子里取。
+//   （接口不是游标分页，页与页之间的先后没有意义；按序号排队只会让慢请求卡住已经回来的结果。）
 // - 推荐接口 /aweme/v1/web/tab/feed/ 不是游标分页：refresh_index 是客户端自增计数、响应里没有游标
 //   （网页版同口径，2026-11 实测并发 2 页安全）。所以允许有限并发；若哪天接口改成依赖串行游标，
 //   把 config.serialCursor 打开，并发就锁死成 1。
@@ -18,22 +19,8 @@ protocol DYFeedItem: Sendable {
     var feedIsPlayable: Bool { get }
 }
 
-enum DYFeedWorker: Int, CaseIterable, Sendable, CustomStringConvertible {
-    /// W1 主推荐请求：没得播 / 用户在等时优先上
-    case primary = 1
-    /// W2 主推荐预取：剩余少于低水位时补
-    case prefetch = 2
-    /// W3 后台候选补充：把待播队列补到目标数
-    case backfill = 3
-    /// W4 备用：有请求失败时顶上；平时负责候选的封面等缓存准备（不建播放器、不下视频）
-    case standby = 4
-    var description: String { "W\(rawValue)" }
-}
-
 struct DYFeedPipelineConfig: Sendable, Equatable {
-    /// 启用几个 Worker 角色（1 / 2 / 4，按 W1…W4 顺序启用）
-    var workers = 4
-    /// 同时最多几个推荐 API 请求。先定 2：验证过安全性与性能再考虑加
+    /// 同时最多几个推荐 API 请求（1…4）。先定 2：实测 4 并发开始出现跨页重复、供应却没增加
     var maxConcurrent = 2
     /// 接口依赖串行游标时必须为 true（并发锁成 1）
     var serialCursor = false
@@ -43,10 +30,13 @@ struct DYFeedPipelineConfig: Sendable, Equatable {
     var lowWater = 8
     /// 起播时至少拿到几条就可以先交出去
     var firstBatch = 3
-    /// 估算每页能拿到几条新内容（决定在途请求够不够，避免超量请求）
+    /// 估算每页能拿到几条新内容（决定在途请求够不够，避免超量请求）。
+    /// 这是还没有样本时的初值，之后按最近几页实际拿到的新内容数滚动估算。
     var expectedPerPage = 4
-    /// 单个请求超时（秒）：超时视为失败，后面的结果不被它卡住
+    /// 单个请求超时（秒）：超时视为失败并让出并发名额
     var requestTimeout: Double = 12
+    /// 超时后再等这么久（秒）：期间结果晚到仍然收进池子，并撤销那次超时的退避
+    var lateGrace: Double = 20
     /// 每分钟最多发几个推荐请求（硬上限，防止异常时狂刷接口）
     var maxRequestsPerMinute = 24
     /// 一轮补充（从低水位补到目标）最多发几个请求；不为凑数无限请求
@@ -60,17 +50,14 @@ struct DYFeedPipelineConfig: Sendable, Equatable {
     /// 候选池内存上限（只存元数据）
     var poolCap = 80
 
-    var effectiveConcurrency: Int { serialCursor ? 1 : max(1, min(maxConcurrent, workers, 4)) }
-    var activeWorkers: [DYFeedWorker] { Array(DYFeedWorker.allCases.prefix(max(1, min(workers, 4)))) }
+    var effectiveConcurrency: Int { serialCursor ? 1 : max(1, min(maxConcurrent, 4)) }
 
-    /// 默认 4 个角色、并发 2。DEBUG 下可用环境变量做 1 / 2 / 4 Worker 对比：
-    /// DOUDUO_FEED_WORKERS=1|2|4（并发同步取同值），DOUDUO_FEED_CONCURRENCY 单独覆盖并发。
+    /// 默认并发 2。DEBUG 下可用环境变量做并发 1 / 2 / 4 对比：
+    /// DOUDUO_FEED_CONCURRENCY=1…4；DOUDUO_FEED_WORKERS=1|2|4 是旧名字，含义相同（feed_bench.sh 还在用）。
     static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Self {
         var c = Self()
         #if DEBUG
-        if let w = env["DOUDUO_FEED_WORKERS"].flatMap(Int.init), [1, 2, 4].contains(w) {
-            c.workers = w; c.maxConcurrent = w
-        }
+        if let w = env["DOUDUO_FEED_WORKERS"].flatMap(Int.init), [1, 2, 4].contains(w) { c.maxConcurrent = w }
         if let n = env["DOUDUO_FEED_CONCURRENCY"].flatMap(Int.init), (1...4).contains(n) { c.maxConcurrent = n }
         if env["DOUDUO_FEED_SERIAL"] == "1" { c.serialCursor = true }
         #endif
@@ -83,7 +70,6 @@ struct DYFeedTicket: Sendable, Equatable {
     let seq: Int
     let refreshIndex: Int
     let pull: String
-    let worker: DYFeedWorker
     let generation: Int
 }
 
@@ -193,8 +179,9 @@ struct DYSharedVideoPool<Item: DYFeedItem>: Sendable {
 
 // MARK: - 指标
 
-/// 1 / 2 / 4 Worker 对比用的指标
+/// 并发 1 / 2 / 4 对比用的指标
 struct DYFeedMetricsSnapshot: Sendable, Codable, Equatable {
+    /// 旧字段，现在恒等于 concurrency（压测结果文件名和旧 JSON 还在用）
     var workers = 0
     var concurrency = 0
     var requests = 0
@@ -218,6 +205,15 @@ struct DYFeedMetricsSnapshot: Sendable, Codable, Equatable {
     var errorRate: Double { requests == 0 ? 0 : Double(failed + timedOut) / Double(requests) }
     var duplicateRate: Double { returned == 0 ? 0 : Double(duplicates) / Double(returned) }
     var uniquePerSecond: Double { activeSeconds <= 0 ? 0 : Double(fresh) / activeSeconds }
+
+    /// 样本数组只留最近这么多个，长会话不无限增长
+    static let sampleCap = 500
+    mutating func addLatency(_ ms: Int) { Self.push(ms, to: &latenciesMs) }
+    mutating func addFirstFrame(_ ms: Int) { Self.push(ms, to: &firstFramesMs) }
+    private static func push(_ v: Int, to xs: inout [Int]) {
+        xs.append(v)
+        if xs.count > sampleCap { xs.removeFirst(xs.count - sampleCap) }
+    }
 
     static func percentile(_ xs: [Int], _ p: Double) -> Int? {
         guard !xs.isEmpty else { return nil }
@@ -255,12 +251,14 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
 
     // 序号：唯一、单调递增，跨刷新不回退（refresh_index 跟网页版一样一直往上数）
     private var nextSeq = 1
-    /// 下一个该合并的序号：结果按序号顺序合并，先回来的后发请求在缓冲里等
-    private var nextMerge = 1
     private var generation = 0
     private var inFlight: [Int: (ticket: DYFeedTicket, started: Double)] = [:]
-    private var finished: [Int: Outcome] = [:]
+    /// 已判超时、但还在宽限期内等晚到结果的请求（不占并发名额）：seq → 发出时间
+    private var late: [Int: Double] = [:]
+    private var tasks: [Int: Task<Void, Never>] = [:]
 
+    /// 最近一页接口自己报的 has_more，仅供界面参考。推荐流没有「到底」，不拿它停管线：
+    /// 风控 / 登录抖动回一次空页就永久断粮不划算，空页交给 emptyStreak 暂停处理。
     private(set) var hasMore = true
     private(set) var lastError: String?
     /// 播放列表里当前条之后还有几条（UI 报上来）
@@ -270,9 +268,19 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
     private var episodeRequests = 0
     private var emptyStreak = 0
     private var failStreak = 0
-    private var pausedUntil: Double = 0
+    /// 失败退避：接口在出错，用户在等也得尊重
+    private var backoffUntil: Double = 0
+    /// 省请求的暂停（连续空页 / 单轮预算用完）：用户在等（urgent）时跳过，仍受每分钟上限约束
+    private var idleUntil: Double = 0
+    private var pausedUntil: Double { urgent ? backoffUntil : max(backoffUntil, idleUntil) }
     private var recentStarts: [Double] = []
-    private var wakeScheduled = false
+    /// 已约的唤醒时间（0 = 没约）；token 用来让被改约掉的旧唤醒失效
+    private var wakeAt: Double = 0
+    private var wakeToken = 0
+    /// 上一次计入 failStreak 的时刻：在它之前发出的请求再失败属于同一轮，不重复翻倍退避
+    private var lastFailAt: Double = -.infinity
+    /// 最近几页各拿到几条新内容（滚动估算 expectedPerPage）
+    private var recentFresh: [Int] = []
     /// 每合并一次（不管有没有新内容 / 失败）+1，等待方据此知道「有新结果了」
     private var mergeEpoch = 0
     private var waiters: [(epoch: Int, cont: CheckedContinuation<Bool, Never>)] = []
@@ -288,7 +296,7 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
         self.pool = DYSharedVideoPool(cap: config.poolCap)
         self.now = now
         self.log = log
-        metrics.workers = config.activeWorkers.count
+        metrics.workers = config.effectiveConcurrency
         metrics.concurrency = config.effectiveConcurrency
     }
 
@@ -337,7 +345,7 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
     /// 刷新推荐：作废在途请求，清空候选（失败时可还原），然后紧急拉新一批
     func beginRefresh() -> [Item] {
         invalidateInFlight()
-        hasMore = true; lastError = nil; failStreak = 0; emptyStreak = 0; pausedUntil = 0
+        hasMore = true; lastError = nil; failStreak = 0; emptyStreak = 0; backoffUntil = 0; idleUntil = 0
         playlistAhead = 0
         return pool.clearCandidates()
     }
@@ -347,18 +355,19 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
     func reset() {
         invalidateInFlight()
         pool.reset()
-        hasMore = true; lastError = nil; failStreak = 0; emptyStreak = 0; pausedUntil = 0
+        hasMore = true; lastError = nil; failStreak = 0; emptyStreak = 0; backoffUntil = 0; idleUntil = 0
         playlistAhead = 0; urgent = false; filling = false; episodeRequests = 0
+        lastFailAt = -.infinity; recentFresh = []
     }
 
     func snapshot() -> DYFeedMetricsSnapshot { metrics }
     func noteSwipe(waited: Bool) { metrics.swipes += 1; if waited { metrics.swipeWaits += 1 } }
-    func noteFirstFrame(ms: Int) { metrics.firstFramesMs.append(ms) }
+    func noteFirstFrame(ms: Int) { metrics.addFirstFrame(ms) }
 
     // MARK: 内部
 
     private var isIdle: Bool {
-        inFlight.isEmpty && (!hasMore || !filling || now() < pausedUntil || !canStart)
+        inFlight.isEmpty && (!filling || now() < pausedUntil || !canStart)
     }
 
     private var canStart: Bool { fetch != nil }
@@ -367,8 +376,9 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
         generation += 1
         if !inFlight.isEmpty { metrics.stale += inFlight.count }
         inFlight.removeAll()
-        finished.removeAll()
-        nextMerge = nextSeq
+        late.removeAll()
+        for t in tasks.values { t.cancel() }
+        tasks.removeAll()
         resumeWaiters(force: true)
     }
 
@@ -380,125 +390,138 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
         } else if (pending < config.lowWater || urgent) && !filling {
             filling = true; episodeRequests = 0
         }
-        guard filling, hasMore, fetch != nil else { resumeWaiters(); return }
+        guard filling, fetch != nil else { resumeWaiters(); return }
         let t = now()
         guard t >= pausedUntil else { scheduleWake(at: pausedUntil); resumeWaiters(); return }
         recentStarts.removeAll { t - $0 > 60 }
         while inFlight.count < config.effectiveConcurrency {
             // 在途请求预计能补够目标就不再多发
-            if !urgent, pending + inFlight.count * config.expectedPerPage >= config.target { break }
+            if !urgent, pending + inFlight.count * expectedPerPage >= config.target { break }
             if episodeRequests >= config.episodeBudget {
                 log("DDPIPE budget reached req=\(episodeRequests) pending=\(pending)，暂停补充")
                 filling = false; urgent = false; episodeRequests = 0
-                pausedUntil = t + config.emptyPause
+                idleUntil = t + config.emptyPause
                 break
             }
             if recentStarts.count >= config.maxRequestsPerMinute {
                 scheduleWake(at: (recentStarts.first ?? t) + 60)
                 break
             }
-            guard let worker = nextWorker(pending: pending) else { break }
-            start(worker, at: t)
+            start(at: t)
         }
         resumeWaiters()
     }
 
-    private func nextWorker(pending: Int) -> DYFeedWorker? {
-        let active = config.activeWorkers
-        let busy = Set(inFlight.values.map(\.ticket.worker))
-        func free(_ w: DYFeedWorker) -> Bool { active.contains(w) && !busy.contains(w) }
-        let needNow = urgent || pending < config.firstBatch
-        let order: [DYFeedWorker] = needNow ? [.primary, .prefetch, .backfill, .standby]
-                                            : [.prefetch, .backfill, .standby, .primary]
-        for w in order where free(w) {
-            switch w {
-            // 只有一个角色时 W1 包办一切；否则 W1 留给「用户在等」
-            case .primary: if needNow || active.count == 1 { return w }
-            case .prefetch: if pending < config.target { return w }
-            case .backfill: if pending < config.target { return w }
-            // 备用：有失败时顶上，或者快断粮了
-            case .standby: if failStreak > 0 || pending < config.lowWater { return w }
-            }
-        }
-        return nil
+    /// 每页预计拿到几条新内容：最近 5 页的平均（至少 1），没有样本时用配置的初值
+    private var expectedPerPage: Int {
+        guard !recentFresh.isEmpty else { return max(1, config.expectedPerPage) }
+        return max(1, Int((Double(recentFresh.reduce(0, +)) / Double(recentFresh.count)).rounded()))
     }
 
-    private func start(_ worker: DYFeedWorker, at t: Double) {
+    private func start(at t: Double) {
         guard let fetch else { return }
         let seq = nextSeq
         nextSeq += 1
         // 跟原来一致：refresh_index 从 2 开始，第一个请求 pull_type=0，之后 2
         let ticket = DYFeedTicket(seq: seq, refreshIndex: seq + 1, pull: seq == 1 ? "0" : "2",
-                                  worker: worker, generation: generation)
+                                  generation: generation)
         inFlight[seq] = (ticket, t)
         episodeRequests += 1
         recentStarts.append(t)
         metrics.requests += 1
         metrics.maxInFlight = max(metrics.maxInFlight, inFlight.count)
         if firstRequestAt == nil { firstRequestAt = t }
-        log("DDPIPE start \(worker) seq=\(seq) refresh=\(ticket.refreshIndex) inFlight=\(inFlight.count) pending=\(pending) urgent=\(urgent)")
-        Task {
+        log("DDPIPE start seq=\(seq) refresh=\(ticket.refreshIndex) inFlight=\(inFlight.count) pending=\(pending) urgent=\(urgent)")
+        tasks[seq] = Task {
             let outcome: Outcome
             do { outcome = .page(try await fetch(ticket)) } catch { outcome = .failure(error.localizedDescription) }
             self.complete(ticket, outcome)
         }
-        let timeout = config.requestTimeout
+        let timeout = config.requestTimeout, grace = config.lateGrace
         Task {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             self.complete(ticket, .timeout)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, grace) * 1_000_000_000))
+            self.expireLate(ticket)
         }
     }
 
     private func complete(_ ticket: DYFeedTicket, _ outcome: Outcome) {
-        // 已作废（刷新 / 重置）或已超时处理过：丢掉
-        // （作废时 invalidateInFlight 已经记过 stale，这里不重复计）
-        guard ticket.generation == generation, let entry = inFlight.removeValue(forKey: ticket.seq) else { return }
-        let latency = Int((now() - entry.started) * 1000)
-        switch outcome {
-        case .page: metrics.succeeded += 1; metrics.latenciesMs.append(latency)
-        case .failure: metrics.failed += 1
-        case .timeout: metrics.timedOut += 1
+        // 已作废（刷新 / 重置）：丢掉（作废时 invalidateInFlight 已经记过 stale，这里不重复计）
+        guard ticket.generation == generation else { return }
+        let seq = ticket.seq
+        if let entry = inFlight.removeValue(forKey: seq) {
+            let latency = Int((now() - entry.started) * 1000)
+            switch outcome {
+            case .page: metrics.succeeded += 1; metrics.addLatency(latency); tasks[seq] = nil
+            case .failure: metrics.failed += 1; tasks[seq] = nil
+            // 让出并发名额，但请求不取消：宽限期内回来的结果照收
+            case .timeout: metrics.timedOut += 1; late[seq] = entry.started
+            }
+            merge(seq, outcome, started: entry.started)
+        } else if let started = late.removeValue(forKey: seq) {
+            tasks[seq] = nil
+            // 超时后才失败：已经按超时罚过，不重复计
+            guard case .page = outcome else { return }
+            // 超时后晚到的成功结果：改记成功，撤销那次超时的退避（接口其实是通的，只是慢）
+            metrics.timedOut -= 1; metrics.succeeded += 1
+            metrics.addLatency(Int((now() - started) * 1000))
+            backoffUntil = 0; lastFailAt = -.infinity
+            log("DDPIPE late seq=\(seq) 超时后回来，照常合并")
+            merge(seq, outcome, started: started)
+        } else {
+            return
         }
-        finished[ticket.seq] = outcome
-        mergeReady()
         pump()
     }
 
-    /// 按序号合并：nextMerge 没回来，后面的就先等着
-    private func mergeReady() {
-        var merged = 0, any = false
-        while let outcome = finished.removeValue(forKey: nextMerge) {
-            any = true
-            switch outcome {
-            case .page(let p):
-                let r = pool.admit(p.items)
-                metrics.returned += p.items.count
-                metrics.fresh += r.fresh.count
-                metrics.duplicates += r.duplicates
-                metrics.unplayable += r.unplayable
-                hasMore = p.hasMore || !p.items.isEmpty
-                failStreak = 0; lastError = nil
-                emptyStreak = r.fresh.isEmpty ? emptyStreak + 1 : 0
-                merged += r.fresh.count
-                log("DDPIPE merge seq=\(nextMerge) n=\(p.items.count) fresh=\(r.fresh.count) dup=\(r.duplicates) pool=\(pool.count)")
-            case .failure(let msg):
-                failStreak += 1; lastError = msg
-                pausedUntil = max(pausedUntil, now() + min(config.backoffCap, config.backoffBase * pow(2, Double(failStreak - 1))))
-                log("DDPIPE fail seq=\(nextMerge) streak=\(failStreak) \(msg.prefix(80))")
-            case .timeout:
-                failStreak += 1; lastError = "推荐请求超时"
-                pausedUntil = max(pausedUntil, now() + min(config.backoffCap, config.backoffBase * pow(2, Double(failStreak - 1))))
-                log("DDPIPE timeout seq=\(nextMerge) streak=\(failStreak)")
-            }
-            nextMerge += 1
+    /// 宽限期也过了：真正放弃这个请求
+    private func expireLate(_ ticket: DYFeedTicket) {
+        guard ticket.generation == generation, late.removeValue(forKey: ticket.seq) != nil else { return }
+        tasks.removeValue(forKey: ticket.seq)?.cancel()
+    }
+
+    /// 失败退避按「轮」翻倍：并发的几个请求一起失败只算一次，
+    /// 否则并发 2 时一次接口抖动就连翻两档。
+    private func penalize(started: Double) {
+        guard started >= lastFailAt else { return }
+        let t = now()
+        failStreak += 1; lastFailAt = t
+        backoffUntil = max(backoffUntil, t + min(config.backoffCap, config.backoffBase * pow(2, Double(failStreak - 1))))
+    }
+
+    /// 先到先合并：结果一回来就进池子，不等前面序号的慢请求
+    private func merge(_ seq: Int, _ outcome: Outcome, started: Double) {
+        var merged = 0
+        switch outcome {
+        case .page(let p):
+            let r = pool.admit(p.items)
+            metrics.returned += p.items.count
+            metrics.fresh += r.fresh.count
+            metrics.duplicates += r.duplicates
+            metrics.unplayable += r.unplayable
+            hasMore = p.hasMore || !p.items.isEmpty
+            failStreak = 0; lastError = nil; lastFailAt = -.infinity
+            emptyStreak = r.fresh.isEmpty ? emptyStreak + 1 : 0
+            merged = r.fresh.count
+            recentFresh.append(merged)
+            if recentFresh.count > 5 { recentFresh.removeFirst() }
+            log("DDPIPE merge seq=\(seq) n=\(p.items.count) fresh=\(r.fresh.count) dup=\(r.duplicates) pool=\(pool.count)")
+        case .failure(let msg):
+            lastError = msg
+            penalize(started: started)
+            log("DDPIPE fail seq=\(seq) streak=\(failStreak) \(msg.prefix(80))")
+        case .timeout:
+            lastError = "推荐请求超时"
+            penalize(started: started)
+            log("DDPIPE timeout seq=\(seq) streak=\(failStreak)")
         }
-        guard any else { return }
         mergeEpoch += 1
         if let first = firstRequestAt { metrics.activeSeconds = now() - first }
         if emptyStreak >= config.maxEmptyStreak {
             log("DDPIPE \(emptyStreak) 页没有新内容，暂停 \(Int(config.emptyPause))s")
             emptyStreak = 0; filling = false; urgent = false
-            pausedUntil = now() + config.emptyPause
+            idleUntil = now() + config.emptyPause
         }
         if merged > 0 { urgent = false }
         if merged > 0, let onSupply { Task { await onSupply() } }
@@ -517,14 +540,21 @@ actor DYFeedCoordinator<Item: DYFeedItem> {
         waiters = keep
     }
 
+    /// 约一次唤醒。已经约了更早（或一样早）的就不动；新时间更早则改约，旧的那次作废。
     private func scheduleWake(at t: Double) {
-        guard !wakeScheduled else { return }
-        wakeScheduled = true
+        if wakeAt > 0, wakeAt <= t { return }
+        wakeAt = t
+        wakeToken += 1
+        let token = wakeToken
         let delay = max(0.05, t - now())
         Task {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            self.wake()
+            self.wake(token)
         }
     }
-    private func wake() { wakeScheduled = false; pump() }
+    private func wake(_ token: Int) {
+        guard token == wakeToken else { return }
+        wakeAt = 0
+        pump()
+    }
 }

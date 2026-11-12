@@ -1,4 +1,4 @@
-# 推荐流供应管线（4-Worker Feed Pipeline + Shared Video Pool）
+# 推荐流供应管线（Feed Pipeline + Shared Video Pool）
 
 代码：`DouDuo/DouyinFeedPipeline.swift`（纯 Foundation，可单独编译测试）、`DYFeedModel`（`DouyinFeedView.swift`）。
 
@@ -13,20 +13,21 @@ DYFeedModel（@MainActor）── deliver() ← 播放列表 items 唯一的追�
   ▼
 DYFeedCoordinator（actor，独占全部共享状态）
   ├─ 序号 seq（唯一、单调递增，跨刷新不回退）→ refresh_index = seq+1，第一个请求 pull_type=0
-  ├─ 在途请求表 + 乱序结果缓冲：按 seq 顺序合并（seq 超时视为失败，不卡后面）
+  ├─ 在途请求表：结果先到先合并（接口不是游标分页，页间顺序无意义）；
+  │   超时让出并发名额，之后 20s 内晚到的结果照收并撤销那次超时
   ├─ DYSharedVideoPool：候选元数据，保持服务端顺序，全来源统一去重，按竖横比例取
   ├─ 水位：待播（列表里当前条之后 + 池）< 8 开始补，补到 20 停
-  └─ 保护：并发上限、每轮最多 8 个请求、每分钟 24 个、连续 3 页无新内容暂停 20s、失败指数退避
+  └─ 保护：并发上限、每轮最多 8 个请求、每分钟 24 个、连续 3 页无新内容暂停 20s、失败指数退避（按轮翻倍）；
+      用户在等（urgent）时跳过「空页 / 预算」暂停，失败退避和每分钟上限照旧
   │ ticket
   ▼
-Worker（只拿票去请求，不碰 refresh_index、不碰播放列表）
-  W1 主推荐请求：用户在等 / 待播 < 3 时优先
-  W2 主推荐预取：待播 < 20 时补
-  W3 后台候选补充：待播 < 20 时补
-  W4 备用：有失败时顶上、或待播 < 8；新候选合并后给池子前几条暖封面（只是图片）
+请求（只拿票去请求，不碰 refresh_index、不碰播放列表）
+  发不发只看一条：用户在等，或「待播 + 在途 × 每页预计新增」还不到 20
+  （每页预计新增按最近 5 页实际拿到的新内容滚动估算）
 ```
 
-并发：默认 4 个角色、**同时最多 2 个推荐请求**。`/aweme/v1/web/tab/feed/` 不是游标分页
+并发：**同时最多 2 个推荐请求**。早期版本有 W1–W4 四个角色，实际只是启动条件略有不同的标签，
+已收敛成上面这一条判断；`DOUDUO_FEED_WORKERS` 仍可用，含义等同并发数。`/aweme/v1/web/tab/feed/` 不是游标分页
 （refresh_index 是客户端计数，响应里没有游标），所以允许有限并发；若接口改成依赖串行游标，
 把 `DYFeedPipelineConfig.serialCursor` 设为 true，并发即锁为 1。
 
@@ -45,7 +46,7 @@ Worker（只拿票去请求，不碰 refresh_index、不碰播放列表）
 ## 测试与对比
 
 - 逻辑测试（不需要模拟器 / 网络）：`scripts/test_feed_pipeline.sh`
-- 1 / 2 / 4 Worker 实测：`scripts/feed_bench.sh <DouDuo.app> [每轮秒数] [每条停留秒数]`
+- 并发 1 / 2 / 4 实测：`scripts/feed_bench.sh <DouDuo.app> [每轮秒数] [每条停留秒数]`
   - DEBUG 环境变量：`DOUDUO_FEED_WORKERS=1|2|4`、`DOUDUO_FEED_CONCURRENCY`、`DOUDUO_FEED_SERIAL=1`、
     `DOUDUO_FEED_AUTOSWIPE=<秒>`、`DOUDUO_FEED_BENCH_SECS=<秒>`
   - 压测模式从空列表起跑、**不上报观看、不写观看历史、不覆盖保存的会话**

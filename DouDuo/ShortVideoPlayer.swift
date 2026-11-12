@@ -56,6 +56,50 @@ final class DDPlayback {
     }
 }
 
+/// 无声排查 + 兜底：App 里还有隐藏的网页（签名页、转发预加载）共用同一个音频会话，
+/// 网页一旦碰媒体，WebKit 可能把会话类别从 .playback 改掉 —— 原生视频照常播但没声，
+/// 滑走再滑回来（重新 setCategory + setActive）就好了。这里在当前条播放期间发现类别被改就立刻改回，
+/// 并把每次会话变化记进 ddlog.txt（DDAUDIO），用来确认是不是这个原因。
+enum DDAudioGuard {
+    static var sessionState: String {
+        let s = AVAudioSession.sharedInstance()
+        return "cat=\(s.category.rawValue) mode=\(s.mode.rawValue) opts=\(s.categoryOptions.rawValue)"
+    }
+
+    private static var healLogs = 0
+    /// 当前条正在播时调用（每 0.25s 一次，只读一个属性，类别没变就什么都不做）
+    static func reassert(_ id: String) {
+        let s = AVAudioSession.sharedInstance()
+        guard s.category != .playback else { return }
+        let before = sessionState
+        try? s.setCategory(.playback, mode: .moviePlayback)
+        try? s.setActive(true)
+        if healLogs < 200 {
+            healLogs += 1
+            DYLiveModel.log("DDAUDIO heal \(id) 会话类别被改，已改回：\(before) → \(sessionState)")
+        }
+    }
+
+    static func install() { _ = installed }
+    private static let installed: Bool = {
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { n in
+            let reason = (n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
+            // reason 3 = categoryChange：有人改了会话类别
+            DYLiveModel.log("DDAUDIO routeChange reason=\(reason) \(sessionState)")
+        }
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { n in
+            let type = (n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) ?? 99
+            // type 1 = 被打断开始，0 = 结束
+            DYLiveModel.log("DDAUDIO interruption type=\(type) \(sessionState)")
+        }
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { _ in
+            DYLiveModel.log("DDAUDIO mediaServicesWereReset \(sessionState)")
+        }
+        return true
+    }()
+}
+
 /// 抖音视频 CDN（douyinvod.com）要浏览器 UA + Referer，否则 403（真机实测：plain/CoreMedia UA 403，Safari UA+Referer 206）
 enum DYMedia {
     static let headers = [
@@ -92,7 +136,7 @@ extension PlayerPage {
                          videoAspect: Double = 0,
                          headEndSeconds: Double? = nil, continuationURL: URL? = nil,
                          onSwipeLeft: (() -> Void)? = nil, onSwipeRight: (() -> Void)? = nil,
-                         fillCropLimit: Double = 0.18) -> PlayerPage {
+                         fillCropLimit: Double = 0.18, dragSeek: Bool = true) -> PlayerPage {
         var page = PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
                    resumePosition: resumePosition, preparedPlayer: preparedPlayer, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
@@ -100,7 +144,50 @@ extension PlayerPage {
                    posterURL: posterURL, headEndSeconds: headEndSeconds,
                    continuationURL: continuationURL, videoAspect: videoAspect, title: title, onSwipeLeft: onSwipeLeft, onSwipeRight: onSwipeRight)
         page.fillCropLimit = fillCropLimit
+        page.dragSeek = dragSeek
         return page
+    }
+}
+
+/// 横滑切页的跟手状态。只有挂了 DYSwipeSlide 的视图观察它，拖动时不会让整页 body 重算。
+final class DYSwipeTracker: ObservableObject {
+    /// 当前跟手位移（负 = 往左）
+    @Published var dragX: CGFloat = 0
+    @Published var width: CGFloat = 400
+    /// 起手时问宿主：这个方向有没有可以滑出来的相邻页（有则宿主把它挂上）
+    var accepts: ((CGFloat) -> Bool)?
+    var onCancel: (() -> Void)?
+    private var active: Bool?
+
+    func drag(_ dx: CGFloat, direction: CGFloat) {
+        if active == nil { active = accepts?(direction) ?? false }
+        if active == true { dragX = dx }
+    }
+    func end() { active = nil }
+    func cancel() {
+        let was = active
+        active = nil
+        if was == true { onCancel?() }
+    }
+}
+
+private struct DYSwipeTrackerKey: EnvironmentKey {
+    static let defaultValue: DYSwipeTracker? = nil
+}
+
+extension EnvironmentValues {
+    var dySwipeTracker: DYSwipeTracker? {
+        get { self[DYSwipeTrackerKey.self] }
+        set { self[DYSwipeTrackerKey.self] = newValue }
+    }
+}
+
+/// base：静止时停在第几屏（-1 左一屏 / 0 当前 / +1 右一屏），再叠加跟手位移。
+struct DYSwipeSlide: ViewModifier {
+    @ObservedObject var tracker: DYSwipeTracker
+    let base: CGFloat
+    func body(content: Content) -> some View {
+        content.offset(x: base * tracker.width + tracker.dragX)
     }
 }
 
@@ -228,6 +315,7 @@ struct PlayerPage: View {
     var title: String = ""
     var onSwipeLeft: (() -> Void)? = nil
     var onSwipeRight: (() -> Void)? = nil
+    var dragSeek = true
     /// 竖视频铺满的裁切上限（见 DYMediaViewport.maxCrop）
     var fillCropLimit: Double = 0.18
     /// 上一次刷新「正在播放」信息的位置（约每秒一次）
@@ -235,6 +323,7 @@ struct PlayerPage: View {
     /// 静音（右下角按钮，全局记住）
     @AppStorage("douyin_muted_v1") private var muted = false
     @Environment(\.ddScale) private var ui
+    @Environment(\.dySwipeTracker) private var swipeTracker
 
     private var dmStress: Bool {
         #if DEBUG
@@ -444,8 +533,11 @@ struct PlayerPage: View {
                 if seeking { seekTo(seekPreview); seeking = false; previewImage = nil }
             },
             verticalFirst: true,
-            onSwipeLeft: onSwipeLeft,
-            onSwipeRight: onSwipeRight
+            onSwipeLeft: onSwipeLeft.map { act in { swipeTracker?.end(); act() } },
+            onSwipeRight: onSwipeRight.map { act in { swipeTracker?.end(); act() } },
+            dragSeek: dragSeek,
+            onSwipeDrag: { dx, dir in swipeTracker?.drag(dx, direction: dir) },
+            onSwipeCancel: { swipeTracker?.cancel() }
         )
     }
 
@@ -807,8 +899,35 @@ struct PlayerPage: View {
         failObserver?.invalidate(); failObserver = nil
     }
 
+    /// 无声排查：起播 3 秒后把「这条视频到底有没有音轨」和当时的静音/音量/输出状态记进 ddlog.txt（DDAUDIO）。
+    /// audioTracks=0 → 选到的档位本身没有声音；有音轨但 muted=true / volume=0 → 播放器状态问题；
+    /// 都正常但 sysVol=0 或 route 不对 → 系统音量 / 输出设备问题。
+    private func logAudio(_ p: AVPlayer) {
+        DDAudioGuard.install()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard isActive, player === p, let item = p.currentItem else { return }
+            let itemAudio = item.tracks.filter { $0.assetTrack?.mediaType == .audio }
+            let enabled = itemAudio.filter(\.isEnabled).count
+            let session = AVAudioSession.sharedInstance()
+            let route = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
+            let src = (item.asset as? AVURLAsset)?.url
+            let head = "DDAUDIO \(id)"
+            let state = "itemAudio=\(itemAudio.count) enabled=\(enabled) muted=\(p.isMuted) volume=\(p.volume) rate=\(p.rate) "
+                + "t=\(String(format: "%.1f", p.currentTime().seconds)) status=\(item.status.rawValue) userMuted=\(muted) "
+                + "sysVol=\(session.outputVolume) route=\(route.isEmpty ? "-" : route) \(DDAudioGuard.sessionState) "
+                + "appActive=\(DDPlayback.shared.appIsActive) "
+                + "local=\(src?.isFileURL ?? false) host=\(src?.host ?? "-") q=\(quality ?? "-")"
+            let asset = item.asset
+            Task {
+                let n = (try? await asset.loadTracks(withMediaType: .audio).count) ?? -1
+                DYLiveModel.log("\(head) \(n == 0 ? "NO_AUDIO_TRACK " : "")audioTracks=\(n) \(state)")
+            }
+        }
+    }
+
     /// 起播看门狗：当前屏 6 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
     private func watchdog(_ p: AVPlayer) {
+        logAudio(p)
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
             let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
@@ -915,6 +1034,7 @@ struct PlayerPage: View {
                 if !seeking { current = t.seconds }
                 if !firstFrame, t.seconds > 0.02 { firstFrame = true }
                 if isActive { DDNowPlaying.id = id; DDNowPlaying.time = t.seconds }
+                if isActive, p.rate > 0 { DDAudioGuard.reassert(id) }
                 dmClock.sync(t.seconds, playing: p.rate > 0 && !seeking, rate: Double(p.rate))
                 refreshNowPlaying(t.seconds)
                 // 锁定倍速：play()/换播放器都会回到 1 倍，每 0.25s 拉回选定速度
@@ -1074,11 +1194,15 @@ struct PlayerPage: View {
 #if DEBUG
 enum DDLaunch { static let t0 = Date() }
 /// 调试：播放状态写进 Documents/ddlog.txt，真机上用 devicectl copy 拉回来看
+private let ddWriteQueue = DispatchQueue(label: "douduo.ddlog", qos: .utility)
 func ddWrite(_ s: String) {
-    let u = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("ddlog.txt")
+    // 时间戳在调用点取，文件读写挪到后台串行队列：顺序不变，不再在主线程上开关文件
     let line = "\(Date()) \(s)\n"
-    if let h = try? FileHandle(forWritingTo: u) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
-    else { try? Data(line.utf8).write(to: u) }
+    ddWriteQueue.async {
+        let u = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("ddlog.txt")
+        if let h = try? FileHandle(forWritingTo: u) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+        else { try? Data(line.utf8).write(to: u) }
+    }
 }
 #endif
 

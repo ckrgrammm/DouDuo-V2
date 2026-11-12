@@ -379,8 +379,15 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         var lastErr: Error = DYError.notReady
         for attempt in 0..<attempts {
             do {
+                // 签名页可能正在自愈重载（healGuardSDK）：等它就绪再发，已就绪时立即返回
+                await waitReady()
                 let r = try await web.callAsyncJavaScript(Self.requestJS + body, arguments: args, contentWorld: .page)
                 guard let s = r as? String, let d = s.data(using: .utf8) else { throw DYError.bad("返回为空") }
+                // 写请求因为「安全 SDK 没加载出来」被拦下（请求并没有发出去）：把 SDK 救回来后原样重发一次
+                if s.utf8.count < 2000, s.contains("-4"), await consumeNoSDKFlag(), await healGuardSDK() {
+                    let again = try await web.callAsyncJavaScript(Self.requestJS + body, arguments: args, contentWorld: .page)
+                    if let s2 = again as? String, let d2 = s2.data(using: .utf8) { return d2 }
+                }
                 return d
             } catch {
                 try Task.checkCancellation()
@@ -392,6 +399,58 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
             }
         }
         throw lastErr
+    }
+
+    // MARK: 安全 SDK 自愈
+    // 偶尔某次页面加载里 window.securitySDK 一直没出来，之后点赞/收藏/关注/评论全被 guardFor 拦下（nosdk），
+    // 以前只能杀进程重开。现在：先再等几秒（可能只是慢）；还没有就重载一次签名页，等 SDK 就绪。
+
+    private var guardHealTask: Task<Bool, Never>?
+    private var lastGuardReload = Date.distantPast
+    private static let guardProbeJS = "!!(window.securitySDK && typeof window.securitySDK.getBdTicketGuardHeader === 'function')"
+
+    private func consumeNoSDKFlag() async -> Bool {
+        let js = "window.__ddNoSdk === 1 ? (window.__ddNoSdk = 0, true) : false"
+        return ((try? await web.evaluateJavaScript(js)) as? Bool) == true
+    }
+
+    private func guardSDKPresent(within seconds: Double) async -> Bool {
+        for _ in 0..<max(1, Int(seconds * 10)) {
+            if ((try? await web.evaluateJavaScript(Self.guardProbeJS)) as? Bool) == true { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+            if Task.isCancelled { return false }
+        }
+        return false
+    }
+
+    /// 返回 true = 安全 SDK 现在可用，可以重发。并发的多个写请求共用同一次自愈。
+    private func healGuardSDK() async -> Bool {
+        if let t = guardHealTask { return await t.value }
+        let t = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            if await self.guardSDKPresent(within: 4) {
+                DYLiveModel.log("DDGUARD heal: SDK 晚到，直接重试")
+                return true
+            }
+            // 一分钟内最多重载一次：SDK 真加载不出来（网络 / 抖音改版）时不反复刷页面
+            guard Date().timeIntervalSince(self.lastGuardReload) > 60 else {
+                DYLiveModel.log("DDGUARD heal: 刚重载过仍无 SDK，放弃")
+                return false
+            }
+            self.lastGuardReload = Date()
+            DYLiveModel.log("DDGUARD heal: 无安全 SDK，重载签名页")
+            self.invalidateReadCache()
+            self.ready = false
+            self.web.load(URLRequest(url: self.startURL))
+            await self.waitReady()
+            let ok = await self.guardSDKPresent(within: 12)
+            DYLiveModel.log("DDGUARD heal: 重载后 SDK=\(ok)")
+            return ok
+        }
+        guardHealTask = t
+        let ok = await t.value
+        guardHealTask = nil
+        return ok
     }
 
     func invalidateReadCache() { readCache.invalidate() }
@@ -473,14 +532,14 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     /// 推荐流一页。refresh_index / pull_type 由 DYFeedCoordinator 统一分配（票），这里不自己计数。
     func fetchFeed(_ ticket: DYFeedTicket) async throws -> DYFeedFetchedPage<DYAweme> {
-        let r = try await fetchFeed(refresh: ticket.refreshIndex, pull: ticket.pull, tag: "\(ticket.worker) seq=\(ticket.seq)")
+        let r = try await fetchFeed(refresh: ticket.refreshIndex, pull: ticket.pull, tag: "seq=\(ticket.seq)")
         return DYFeedFetchedPage(items: r.items, hasMore: r.hasMore)
     }
 
     func fetchFeed(refresh: Int, pull: String, tag: String = "") async throws -> (items: [DYAweme], hasMore: Bool) {
         let t0 = DDPerf.ms
         defer { DYLiveModel.log("DDPERF feed.request #\(refresh) \(tag) took \(DDPerf.ms - t0)ms (start \(t0)ms)") }
-        // 只读一次就不重试：失败交给 coordinator 退避 / 换 Worker，避免一个请求在里面重试 3 次卡住顺序合并
+        // 只读一次就不重试：失败交给 coordinator 退避，避免一个请求在里面重试 3 次占着并发名额
         let d = try await call(Self.feedJS, args: ["refresh": String(refresh), "pull": pull,
                                                    "views": String(watchCount)], attempts: 2)
         let p = try JSONDecoder().decode(DYFeedPage.self, from: d)
@@ -925,6 +984,8 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       const g = await guardFor(method, path);
       // 宁可不发，也不能发一个没签名的写请求把登录态赔进去
       if (g.protected && method === 'POST' && !g.ok) {
+        // 安全 SDK 整个没加载出来：记一笔，原生侧据此重载签名页后重试（见 healGuardSDK）
+        if (g.why === 'nosdk') window.__ddNoSdk = 1;
         return { s: -4, t: '', h: 'ticket-guard missing: ' + (g.why || 'no material') };
       }
       return new Promise(ok => {
@@ -990,8 +1051,10 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         play: main,
         playAlt: redirect && redirect !== main ? redirect : (def && def !== main ? def : null),
         playFast: fast && fast !== main ? fast : null,
-        q: (br ? (br.gear_name || '?') + ' ' + resOf(br) + 'p h265=' + (br.is_h265 ? 1 : 0) + ' ' + Math.round((br.bit_rate || 0) / 1000) + 'k' : 'nolist')
-          + ' | def ' + (pd.width || 0) + 'x' + (pd.height || 0) + ' | gears ' + (v.bit_rate || []).map(r => (r.gear_name || '?') + ':' + Math.round((r.bit_rate || 0) / 1000) + 'k' + (r.is_h265 ? 'h' : '')).join(','),
+        q: (br ? (br.gear_name || '?') + ' ' + resOf(br) + 'p h265=' + (br.is_h265 ? 1 : 0) + ' fmt=' + (br.format || '-') + ' ' + Math.round((br.bit_rate || 0) / 1000) + 'k' : 'nolist')
+          + ' | def ' + (pd.width || 0) + 'x' + (pd.height || 0) + ' | gears ' + (v.bit_rate || []).map(r => (r.gear_name || '?') + ':' + Math.round((r.bit_rate || 0) / 1000) + 'k' + (r.is_h265 ? 'h' : '') + (r.format ? '/' + r.format : '')).join(',')
+          // 无声排查：有没有单独的音频流（音画分离档的声音在这里）、主地址是不是用了默认档
+          + ' | sepAudio ' + ((v.bit_rate_audio || []).length) + ' | main ' + (best ? 'gear' : 'def'),
         cover: first(v.cover) || first(v.origin_cover) || (a.images && a.images[0] && first(a.images[0])) || null,
         images: (a.images || []).map(i => first(i)).filter(Boolean),
         author: { name: (a.author && a.author.nickname) || '', avatar: a.author && first(a.author.avatar_thumb), secUid: a.author && a.author.sec_uid, uid: a.author && a.author.uid ? String(a.author.uid) : null, follow: a.author ? (a.author.follow_status || 0) : 0 },
@@ -1179,6 +1242,10 @@ final class DYPreloader {
 }
 
 // MARK: - 推荐流
+
+final class DYResumeBox {
+    var map: [String: Double] = [:]
+}
 
 enum DYRecommendationAspect: String, CaseIterable, Identifiable {
     case all, portraitFirst, landscapeFirst
@@ -1445,6 +1512,83 @@ final class DYFeedModel: ObservableObject {
     }
 }
 
+private struct DYFoldedRecommendBoundsKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? { nil }
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// 未取得系统遮挡边界时使用的保守设备布局参数，不是摄像头实测轮廓。
+/// 如增加外屏设备型号，应按该型号校准这组预留值，而不是从 safeAreaInsets 推算镜头形状。
+private struct DYFoldedNavigationProfile {
+    var cameraReservedWidth: CGFloat = 56
+    var cameraReservedHeight: CGFloat = 64
+    var cameraTrailingMargin: CGFloat = 16
+    var cameraGap: CGFloat = 20
+    var edgeMargin: CGFloat = 8
+    var buttonSide: CGFloat = 44
+
+    func fallbackCamera(in size: CGSize, safe: EdgeInsets) -> CGRect {
+        CGRect(x: max(0, size.width - max(cameraTrailingMargin, safe.trailing) - cameraReservedWidth),
+               y: 0, width: cameraReservedWidth, height: max(cameraReservedHeight, safe.top))
+    }
+
+    func searchFrame(size: CGSize, safe: EdgeInsets, camera: CGRect, recommend: CGRect) -> CGRect? {
+        let left = max(edgeMargin, safe.leading)
+        let right = size.width - max(edgeMargin, safe.trailing)
+        let top = max(safe.top, 44) + edgeMargin
+        let bottom = size.height - max(edgeMargin, safe.bottom)
+        guard right - left >= buttonSide, bottom - top >= buttonSide else { return nil }
+        let tabs = CGRect(x: left, y: recommend.minY,
+                          width: max(0, recommend.maxX - left), height: recommend.height)
+        // 优先与右上摄像头组合；只放在确实容得下完整点击区域的一侧。
+        // 垂直方向跟顶栏 Tab 同一行（中心对齐「推荐」），不再按摄像头中心定位——那样会比顶栏低一截。
+        let rowY = recommend.midY - buttonSide / 2
+        for x in [camera.minX - cameraGap - buttonSide, camera.maxX + cameraGap] {
+            let frame = CGRect(x: x, y: rowY, width: buttonSide, height: buttonSide)
+            if frame.minX >= left, frame.maxX <= right, frame.maxY <= bottom,
+               !frame.intersects(tabs.insetBy(dx: -edgeMargin, dy: 0)),
+               !frame.intersects(camera) { return frame }
+        }
+        // 同行与 Tab 冲突时只移动搜索按钮：下一行仍优先保持摄像头旁的 20pt 水平间隔。
+        let sideX = [camera.minX - cameraGap - buttonSide, camera.maxX + cameraGap]
+            .first { $0 >= left && $0 + buttonSide <= right }
+        // 极窄窗口两侧均放不下时，退到摄像头下方的右侧安全区。
+        let frame = CGRect(x: sideX ?? (right - buttonSide),
+                           y: max(top, camera.maxY + edgeMargin, recommend.maxY + edgeMargin),
+                           width: buttonSide, height: buttonSide)
+        return frame.maxY <= bottom ? frame : nil
+    }
+}
+
+private struct DYFeedSafeInsetsKey: EnvironmentKey {
+    static let defaultValue = EdgeInsets()
+}
+
+private extension EnvironmentValues {
+    var dyFeedSafeInsets: EdgeInsets {
+        get { self[DYFeedSafeInsetsKey.self] }
+        set { self[DYFeedSafeInsetsKey.self] = newValue }
+    }
+}
+
+private struct DYBottomBleedClip: Shape {
+    let extra: CGFloat
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height + extra))
+    }
+}
+
+/// Clip B at the media container, before adding the separate controls region.
+/// A retains its original overflow behavior. Changing the shape preserves content identity.
+private struct DYFeedMediaBoundary: Shape {
+    let enabled: Bool
+    func path(in rect: CGRect) -> Path {
+        Path(enabled ? rect : rect.insetBy(dx: -100_000, dy: -100_000))
+    }
+}
+
 struct DouyinFeedScreen: View {
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
@@ -1453,11 +1597,13 @@ struct DouyinFeedScreen: View {
     @StateObject private var feed = DYFeedModel()
     @State private var insets = EdgeInsets()
     @State private var preloader = DYPreloader()
-    @State private var resume: [String: Double] = [:]
+    /// 续播进度只在页面起播时读一次：放进引用盒子，写入不触发整个推荐流重算（滑走时每条都会写）。
+    @State private var resume = DYResumeBox()
+    @State private var focusTask: Task<Void, Never>?
     @State private var currentID: String?
     @State private var scrollID: String?
     @State private var userScrolling = false
-    @State private var dragStartID: String?
+    @State private var draggingRecommendation = false
     @State private var scrollEndTask: Task<Void, Never>?
     @State private var initialized = false
     @State private var refreshing = false
@@ -1482,6 +1628,10 @@ struct DouyinFeedScreen: View {
     @AppStorage("douyin_muted_v1") private var muted = false
     @State private var pendingUpdate: DDUpdate?
     @State private var showFollowComments = false
+    /// 横滑切页：跟手位移放在 tracker 里（不触发本视图重算），这里只记当前预挂了哪一个相邻页
+    @State private var swipe = DYSwipeTracker()
+    @State private var swipeReveal: DYSwipeReveal?
+    private enum DYSwipeReveal { case follow, recommend, messages }
     @State private var showMessages = false
     /// 盖在视频上的页面（我的/信息/搜索/作者）打开时，所有视频和直播都停
     private var overlayOpen: Bool { showSearch || showMine || showMessages || authorTarget != nil }
@@ -1489,6 +1639,20 @@ struct DouyinFeedScreen: View {
     @State private var topNudge: CGFloat = 0
     /// 顶栏可用宽度：评论栏从右侧滑出时 = 视频区宽度，顶栏跟着视频居中、自适应收紧
     @State private var topBarWidth: CGFloat?
+    /// A · 经典布局已下线：固定走 B / C。A 的分支代码（各处 immersiveLayout 为 false 的那一半）
+    /// 原样留在源码里，只是不再可达；要恢复就把这一行换回
+    /// @AppStorage("douyin_immersive_layout_v1") private var immersiveLayout = false，并把设置里的 A 选项放回去。
+    private let immersiveLayout = true
+    /// C · 通透布局：在 B 的基础上，外屏也用 B 内屏那套（画面铺满整屏，顶栏 / 按钮列玻璃压在画面上）。
+    /// 只在 immersiveLayout 为 true 时有意义。
+    @AppStorage("douyin_overlay_layout_v1") private var overlayLayout = false
+    /// 画面铺满、控件压在画面上：B 的内屏，以及 C 的内外屏
+    private var fullBleed: Bool { hSize != .compact || overlayLayout }
+    /// 设置菜单用：1 = B，2 = C（0 = A 已下线）
+    private var layoutChoice: Binding<Int> {
+        Binding(get: { overlayLayout ? 2 : 1 },
+                set: { overlayLayout = $0 == 2 })
+    }
     @State private var noticeUnread = 0
 
     /// 外屏评论打开（视频缩到面板上方）时顶栏让位
@@ -1505,10 +1669,34 @@ struct DouyinFeedScreen: View {
         GeometryReader { safe in
             ZStack(alignment: .top) {
                 layoutRoot
+                    .environment(\.dyFeedSafeInsets, safe.safeAreaInsets)
                 if !(tab == .live && (live.clean || live.entered)) && !commentsDocked(safe) {
-                    topBar
-                        .padding(.top, max(safe.safeAreaInsets.top, hSize == .compact ? 44 : 16) + 8)
-                        .frame(width: topBarWidth)
+                    // B：外屏（右侧系统条）和内屏都用居中顶栏；普通 iPhone 竖屏保持原来的左排
+                    let outerStrip = immersiveLayout && tab != .live
+                        && (hSize != .compact || safe.safeAreaInsets.trailing >= 80)
+                    // B：顶栏右侧让出的宽度与视频区一致（外屏系统条 84pt，不是固定 70），「推荐」才能落在视频正中
+                    // 内屏例外：「推荐」对齐折痕（屏幕正中），顶栏横跨整屏、不让右侧按钮列；
+                    // 侧边评论栏打开时（topBarWidth 有值）仍按视频区居中。
+                    let hingeCentered = outerStrip && fullBleed && topBarWidth == nil
+                    let railReserve: CGFloat = immersiveLayout && tab != .live && !hingeCentered
+                        ? max(hSize == .compact ? 70 : 78, safe.safeAreaInsets.trailing) : 0
+                    // 直播 / 搜索拉到视频区两端做成玻璃圆钮（内屏顶栏横跨整屏，搜索要停在按钮列左侧）
+                    let statusRow = outerStrip && hSize != .compact
+                        && safe.safeAreaInsets.top >= 60 && safe.safeAreaInsets.trailing < 80
+                    // statusRow：搜索停在右上角时间 / 电量那一组的左边（那一组实测占右侧约 122pt）
+                    let edgeTrailing: CGFloat = statusRow ? 144
+                        : (hingeCentered ? max(78, safe.safeAreaInsets.trailing) + 12 : 12)
+                    topBar(centered: outerStrip, inner: fullBleed, edgeTrailing: edgeTrailing)
+                        // B + 外屏：状态栏在右侧系统条里，顶部没有东西要让，顶栏直接贴到顶部安全区
+                        // 内屏竖放：时间 / 电量横排在右上角（顶部安全区 82pt，右侧没有系统条）。
+                        // 顶栏不再排到这条安全区下面，而是和状态栏同一行：状态栏那一组在顶部安全区里上下居中
+                        // 略偏下（真机实测中线距顶约 48pt，安全区 82pt），48pt 高的顶栏按同一条中线放。
+                        .padding(.top, statusRow ? safe.safeAreaInsets.top / 2 - 17
+                                 : max(safe.safeAreaInsets.top,
+                                       immersiveLayout && safe.safeAreaInsets.trailing >= 80 ? 4
+                                       : (hSize == .compact ? 44 : 16)) + 8)
+                        .frame(width: topBarWidth.map { max(0, $0 - railReserve) })
+                        .padding(.trailing, railReserve)
                         .background {
                             GeometryReader { bar in
                                 LinearGradient(colors: [.black.opacity(0.62), .black.opacity(0.22), .clear],
@@ -1518,6 +1706,15 @@ struct DouyinFeedScreen: View {
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .overlayPreferenceValue(DYFoldedRecommendBoundsKey.self) { anchor in
+                // B + 外屏：搜索已经排进居中的顶栏里，不再单独浮一颗
+                if hSize == .compact, let anchor,
+                   !(immersiveLayout && tab != .live && safe.safeAreaInsets.trailing >= 80) {
+                    GeometryReader { geo in
+                        foldedSearch(in: geo, safeInsets: safe.safeAreaInsets, recommend: geo[anchor])
+                    }
                 }
             }
             .ignoresSafeArea(edges: [.top, .horizontal])
@@ -1558,7 +1755,7 @@ struct DouyinFeedScreen: View {
             // 秒开：先播上次缓存好、还没看过的；连接抖音 / 拉推荐在后台接着往后补
             if feed.items.isEmpty, !DYFeedBench.isBenchRun, let saved = DYFeedSession.load() {
                 feed.items = saved.items
-                resume = saved.positions
+                resume.map = saved.positions
                 currentID = saved.currentID
                 scrollID = saved.currentID
                 for a in saved.items {
@@ -1613,7 +1810,7 @@ struct DouyinFeedScreen: View {
                 case "follow": tab = .follow
                 case "author": authorTarget = current?.author
                 case "comments": showComments = true
-                case "messages": showMessages = true
+                case "messages": setMessages(true)
                 case "login": web = DYWebTarget(url: URL(string: "https://www.douyin.com/?recommend=1")!)
                 case "qr": Task { await bridge.debugQRLogin() }
                 case "export": Task { await bridge.debugExportCookies() }
@@ -1663,13 +1860,23 @@ struct DouyinFeedScreen: View {
                 // 滑动等待：切到这条时后面已经没有可播的了（下一滑得等供应）
                 DYFeedBench.becameCurrent(new, waited: i + 1 >= feed.items.count)
             }
-            focusCurrent()
+            // 换条发生在翻页减速动画中途：建/拆预加载播放器、补列表都推到停稳后再做，连滑时只算最后一条。
+            // 后面已经没有可播的（用户在等供应）或上一条不存在（起播/刷新）时不延后。
+            focusTask?.cancel()
+            let lastOne = new.flatMap { id in feed.items.firstIndex { $0.id == id } }.map { $0 + 1 >= feed.items.count } ?? true
+            if old == nil || lastOne { focusCurrent() }
+            else {
+                focusTask = Task {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    if !Task.isCancelled { focusCurrent() }
+                }
+            }
             saveSession()
             reportWatch(old: old, new: new)
             prefetchNextComments(after: new)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            saveSession()
+            saveSession(sync: true)
             DYFeedBench.dump("resign")
         }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
@@ -1691,11 +1898,24 @@ struct DouyinFeedScreen: View {
         }) { t in
             DouyinWebScreen(start: t.url)
         }
-        .fullScreenCover(isPresented: $showMessages) {
-            DYMessagesScreen(bridge: bridge, onClose: { showMessages = false }, onWeb: { u in
-                showMessages = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: u) }
-            })
+        // 消息不再用系统 cover（只能自下而上）：作为右边一屏挂在这里，跟推荐 / 关注一起横向滑
+        .overlay {
+            if showMessages || swipeReveal == .messages {
+                DYMessagesScreen(bridge: bridge, onClose: { setMessages(false) }, onWeb: { u in
+                    setMessages(false)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: u) }
+                })
+                .modifier(DYSwipeSlide(tracker: swipe, base: showMessages ? 0 : 1))
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width + $0.safeAreaInsets.leading + $0.safeAreaInsets.trailing } action: { swipe.width = $0 }
+        .onAppear {
+            swipe.accepts = { dir in swipeBegan(dir) }
+            swipe.onCancel = {
+                withAnimation(.snappy(duration: 0.25), completionCriteria: .logicallyComplete) {
+                    swipe.dragX = 0
+                } completion: { swipeReveal = nil }
+            }
         }
         .task(id: bridge.ready) {
             // 顶栏头像与消息红点：签名页每次（重新）就绪都重读一次。登录 / 重新登录后签名页会 reload，
@@ -1783,7 +2003,7 @@ struct DouyinFeedScreen: View {
         Task {
             await feed.remix(after: currentIndex)
             DYLiveModel.log("DDMIX remix preference=\(feed.aspectPreference.rawValue) upcoming=\(feed.items.count - (currentIndex ?? -1) - 1)")
-            if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+            if currentID == nil { currentID = feed.items.first?.id }
             focusCurrent()
         }
     }
@@ -1811,10 +2031,17 @@ struct DouyinFeedScreen: View {
 
         return ZStack(alignment: .topLeading) {
             // 外屏：评论面板从底部升起，视频缩到上方继续播（关注流在 DYFollowFeed 里自己挂）
-            DYCommentDock(enabled: layout.docked && tab == .recommend && current != nil, isOpen: $showComments) {
+            DYCommentDock(panelID: current?.id, enabled: layout.docked && tab == .recommend && current != nil, isOpen: $showComments) {
                 feedArea
-                    .frame(width: videoW, height: videoH, alignment: .topLeading)
-                    .clipped()
+                    // B keeps the paging/player viewport stable while comments animate.
+                    // Scale the existing presentation instead of repeatedly refitting 9:16 media.
+                    .frame(width: immersiveLayout ? w : videoW,
+                           height: immersiveLayout ? h : videoH, alignment: .topLeading)
+                    .scaleEffect(immersiveLayout ? min(videoW / max(w, 1), videoH / max(h, 1)) : 1)
+                    .frame(width: videoW, height: videoH,
+                           alignment: immersiveLayout ? .center : .topLeading)
+                    // B：视频占满整高时，裁剪框向下放开到屏幕底边，底部安全区不再露出一条黑带
+                    .clipShape(DYBottomBleedClip(extra: immersiveLayout && videoH >= h ? geo.safeAreaInsets.bottom : 0))
             } panel: {
                 if let cur = current {
                     DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
@@ -1833,7 +2060,7 @@ struct DouyinFeedScreen: View {
         }
         .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
         .animation(.snappy, value: fold)
-        .animation(.snappy, value: showComments)
+        .animation(layout.docked ? nil : .snappy, value: showComments)
     }
 
     private func refreshNoticeUnread() async {
@@ -1858,13 +2085,13 @@ struct DouyinFeedScreen: View {
         }
     }
 
-    private func saveSession() {
+    private func saveSession(sync: Bool = false) {
         guard !DYFeedBench.isBenchRun, let id = currentID, feed.items.contains(where: { $0.id == id }) else { return }
-        var positions = resume
+        var positions = resume.map
         if DDNowPlaying.id == id, DDNowPlaying.time.isFinite {
             positions[id] = max(0, DDNowPlaying.time)
         }
-        DYFeedSession(items: feed.items, currentID: id, positions: positions).save()
+        DYFeedSession(items: feed.items, currentID: id, positions: positions).save(sync: sync)
     }
 
     /// 自动连播：播完滑到下一条；快到底时先补一页
@@ -1899,7 +2126,60 @@ struct DouyinFeedScreen: View {
     /// 要换一批推荐走「更多 → 刷新推荐」。
     private func selectTab(_ target: DYTab) {
         guard tab != target else { return }
-        tab = target
+        // 关注 ↔ 推荐：两页并排横向滑动交接；直播等其它切换直接换
+        if tab == .recommend, target == .follow {
+            slide(reveal: .follow, direction: 1) { tab = .follow }
+        } else if tab == .follow, target == .recommend {
+            slide(reveal: .recommend, direction: -1) { tab = .recommend }
+        } else {
+            tab = target
+        }
+    }
+
+    private func setMessages(_ open: Bool) {
+        guard open != showMessages else { return }
+        if open {
+            slide(reveal: .messages, direction: -1) { showMessages = true }
+        } else {
+            // 消息往右滑走，底下的页面从左边跟回来
+            slide(reveal: nil, direction: 1) { showMessages = false }
+        }
+    }
+
+    /// 起手时由手势层来问：这个方向有相邻页就先把它挂到屏幕外，之后位移跟手。
+    /// direction：-1 手指往左（露出右边一页），+1 手指往右。
+    private func swipeBegan(_ direction: CGFloat) -> Bool {
+        guard !overlayOpen, web == nil else { return false }
+        switch tab {
+        case .recommend:
+            if direction < 0 { swipeReveal = .messages; return true }
+            if showComments { return false }          // 右滑先收评论，不跟手
+            swipeReveal = .follow; return true
+        case .follow:
+            guard direction < 0 else { return false }
+            swipeReveal = .recommend; return true
+        default:
+            return false
+        }
+    }
+
+    /// 从当前跟手位置滑完剩下的距离，结束后再真正切状态并把位移清零（两步的画面位置完全一致，不会跳）。
+    private func slide(reveal: DYSwipeReveal?, direction: CGFloat, apply: @escaping () -> Void) {
+        if let reveal { swipeReveal = reveal }
+        // 等一帧让相邻页先挂到屏幕外，再开始动画
+        DispatchQueue.main.async {
+            withAnimation(.snappy(duration: 0.3), completionCriteria: .logicallyComplete) {
+                swipe.dragX = direction * swipe.width
+            } completion: {
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) {
+                    apply()
+                    swipe.dragX = 0
+                    swipeReveal = nil
+                }
+            }
+        }
     }
 
     /// 先拉到新一批再替换，失败不清空当前画面；与预取互斥，避免旧请求覆盖刷新结果。
@@ -1919,9 +2199,9 @@ struct DouyinFeedScreen: View {
         }
         let fresh = feed.items
         showComments = false
-        scrollEndTask?.cancel(); userScrolling = false
         preloader.clear()
-        resume = [:]
+        resume.map = [:]
+        cancelRecommendationScroll()
         currentID = fresh.first?.id
         scrollID = currentID
         saveSession()
@@ -1955,15 +2235,21 @@ struct DouyinFeedScreen: View {
         ZStack(alignment: .top) {
             if tab == .live {
                 DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) }, active: web == nil && !overlayOpen)
-            } else if tab == .follow {
+            }
+            // 关注 / 推荐各自独立挂载：横滑时相邻那一页预先挂在屏幕外，切完后还是同一个实例
+            if tab == .follow || (tab == .recommend && swipeReveal == .follow) {
                 DYFollowFeed(bridge: bridge, insets: insets, model: following, active: tab == .follow && web == nil && !overlayOpen,
                              showComments: $showFollowComments,
                              onAuthor: { a in authorTarget = a.author },
                              onLogin: { web = DYWebTarget(url: DouyinWeb.home) },
                              onToast: { showToast($0) },
-                             onLive: { r in live.open(r); selectTab(.live) })
-            } else {
+                             onLive: { r in live.open(r); selectTab(.live) },
+                             onSwipeToRecommend: { selectTab(.recommend) })
+                    .modifier(DYSwipeSlide(tracker: swipe, base: tab == .follow ? (showMessages ? -1 : 0) : -1))
+            }
+            if tab == .recommend || (tab == .follow && swipeReveal == .recommend) {
                 recommendArea
+                    .modifier(DYSwipeSlide(tracker: swipe, base: tab == .recommend ? (showMessages ? -1 : 0) : 1))
             }
             if let t = feed.toast {
                 Text(t).font(.footnote.weight(.medium)).foregroundStyle(.white)
@@ -1981,6 +2267,7 @@ struct DouyinFeedScreen: View {
                 .allowsHitTesting(false)
             #endif
         }
+        .environment(\.dySwipeTracker, swipe)
         // 顶栏要压在系统状态栏那一行，所以整块忽略顶部安全区；
         // 外屏左右有侧边控制区，安全区会把顶栏整行往左挤，所以水平方向也忽略（视频本来就铺满）
         .ignoresSafeArea(edges: [.top, .horizontal])
@@ -2012,12 +2299,13 @@ struct DouyinFeedScreen: View {
 
     }
 
-    /// 顶部一排：左菜单，中间 关注/推荐/直播，右边 搜索 / 我的
-    /// 顶栏：只留「关注 / 推荐 / 直播」三个纯文字页签，不用胶囊，与状态栏时间/信号同一行。
-    /// 自适应仅收紧间距；消息与头像入口始终保留最小触摸区。
-    private var topBar: some View {
+    /// 外屏独立使用紧凑导航；内屏保持原样：关注/推荐/直播、消息、头像、搜索 紧凑排成一组。
+    /// 两种布局都在状态栏下方，并为右侧前摄预留空间。
+    private func topBar(centered: Bool, inner: Bool, edgeTrailing: CGFloat) -> some View {
         Group {
-            if hSize == .compact {
+            if centered {
+                centeredTopBar(pinRecommend: inner, edgeLeading: hSize != .compact ? 20 : 12, edgeTrailing: edgeTrailing)
+            } else if hSize == .compact || (immersiveLayout && tab != .live) {
                 compactTopBar
             } else {
                 ViewThatFits(in: .horizontal) {
@@ -2029,82 +2317,178 @@ struct DouyinFeedScreen: View {
         }
         .themeShadow(.mediaLabel)
         .frame(maxWidth: .infinity, minHeight: 48)
-        .padding(.trailing, topNudge)
+        // 居中顶栏不躲前摄：两侧内容离屏幕右上角很远，偏移只会把「推荐」带离中线
+        .padding(.trailing, centered ? 0 : topNudge)
     }
 
-    /// 外屏顶栏（仿 TikTok）：左 直播图标 ｜ 中 可横滑文字栏（靠右，「推荐」贴最右，左缘渐隐）｜ 右 搜索
+    /// 外屏按内容宽度从左排列。44pt 点击区已贡献文字两侧留白，
+    /// 再加 6pt 统一间距，常规字号下文字的可见间距约 16pt。
     private var compactTopBar: some View {
-        HStack(spacing: 0) {
-            Button { selectTab(.live) } label: {
-                VStack(spacing: 4) {
-                    Image(systemName: "play.tv")
-                        .font(.system(size: 21, weight: tab == .live ? .bold : .medium))
-                    Capsule().fill(.white).frame(width: 18, height: 2).opacity(tab == .live ? 1 : 0)
-                }
-                .foregroundStyle(.white.opacity(tab == .live ? 1 : 0.9))
-                .frame(width: 48, height: 44)
-                .contentShape(Rectangle())
+        ViewThatFits(in: .horizontal) {
+            compactTopBarRow(spacing: 6)
+                .fixedSize(horizontal: true, vertical: false)
+            compactTopBarRow(spacing: 2)
+                .fixedSize(horizontal: true, vertical: false)
+            // 极窄窗口保留全部入口，横向滚动而不压缩、重叠文字。
+            ScrollView(.horizontal) {
+                compactTopBarRow(spacing: 2)
             }
-            .accessibilityLabel("直播").accessibilityIdentifier("douyin.tab.live")
-
-            GeometryReader { g in
-                ScrollView(.horizontal) {
-                    HStack(spacing: 18) {
-                        compactEntry("我的", selected: false, id: "douyin.mine.top") { showMine = true }
-                        compactEntry("消息", selected: false, dot: noticeUnread > 0, id: "douyin.messages.top") { showMessages = true }
-                        compactEntry(DYTab.follow.title, selected: tab == .follow, id: "douyin.tab.follow") { selectTab(.follow) }
-                        compactEntry(DYTab.recommend.title, selected: tab == .recommend, loading: refreshing, id: "douyin.tab.recommend") {
-                            selectTab(.recommend)
-                        }
-                        .simultaneousGesture(TapGesture(count: 2).onEnded {
-                            selectTab(.recommend); Task { await refreshRecommendations() }
-                        })
-                    }
-                    .padding(.horizontal, 6)
-                    // 内容不满一行时也靠右，和 TikTok 一样当前页签贴着搜索
-                    .frame(minWidth: g.size.width, alignment: .trailing)
-                }
-                .defaultScrollAnchor(.trailing)
-                .scrollIndicators(.hidden)
-                .scrollBounceBehavior(.basedOnSize)
-                .mask {
-                    HStack(spacing: 0) {
-                        LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                            .frame(width: 28)
-                        Color.black
-                    }
-                }
-            }
-            .frame(height: 44)
-
-            Button { showSearch = true } label: {
-                Image(systemName: "magnifyingglass").font(.system(size: 21, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .buttonStyle(.plain).foregroundStyle(.white)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
         .padding(.horizontal, 8)
+    }
+
+    /// B（外屏 / 内屏）：直播、搜索是两端的玻璃圆钮，中间一组文字 Tab。
+    /// pinRecommend（内屏）：两侧等宽弹性占位，「推荐」钉在折痕上；
+    /// 否则（外屏）四个 Tab 整组居中，整条顶栏左右对称。
+    private func centeredTopBar(pinRecommend: Bool, edgeLeading: CGFloat, edgeTrailing: CGFloat) -> some View {
+        ZStack {
+            HStack(alignment: .center, spacing: 6) {
+                HStack(spacing: 6) {
+                    compactEntry("我的", selected: false, id: "douyin.mine.top") { showMine = true }
+                    compactEntry(DYTab.follow.title, selected: tab == .follow, id: "douyin.tab.follow") { selectTab(.follow) }
+                }
+                .frame(maxWidth: pinRecommend ? .infinity : nil, alignment: .trailing)
+                compactRecommendEntry
+                compactEntry("消息", selected: false, dot: noticeUnread > 0, id: "douyin.messages.top") { setMessages(true) }
+                    .frame(maxWidth: pinRecommend ? .infinity : nil, alignment: .leading)
+            }
+            HStack(spacing: 0) {
+                compactLiveButton(inGlass: true).ddGlassCapsule(clear: pinRecommend)
+                Spacer(minLength: 0)
+                compactSearchButton.ddGlassCapsule(clear: pinRecommend)
+            }
+            .padding(.leading, edgeLeading)
+            .padding(.trailing, edgeTrailing)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+    }
+
+    private var compactSearchButton: some View {
+        Button { showSearch = true } label: {
+            Image(systemName: "magnifyingglass")
+                .resizable().scaledToFit()
+                .fontWeight(.semibold)
+                .frame(width: 20, height: 20)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
+    }
+
+    /// inGlass：玻璃圆钮里的图标缩到和搜索图标（20pt）视觉等大
+    private func compactLiveButton(inGlass: Bool = false) -> some View {
+        Button { selectTab(.live) } label: {
+            Image(systemName: "play.tv")
+                .resizable().scaledToFit()
+                .frame(width: inGlass ? 23 : 32, height: inGlass ? 18 : 24)
+                .foregroundStyle(.white.opacity(tab == .live ? 1 : 0.9))
+                .frame(width: 44, height: 44)
+                .overlay(alignment: .bottom) {
+                    Capsule().fill(.white).frame(width: 18, height: 2.5)
+                        .opacity(tab == .live ? 1 : 0)
+                }
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("直播").accessibilityIdentifier("douyin.tab.live")
+    }
+
+    private var compactRecommendEntry: some View {
+        compactEntry(DYTab.recommend.title, selected: tab == .recommend, loading: refreshing, id: "douyin.tab.recommend") {
+            selectTab(.recommend)
+        }
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            selectTab(.recommend); Task { await refreshRecommendations() }
+        })
+    }
+
+    private func compactTopBarRow(spacing: CGFloat) -> some View {
+        HStack(alignment: .center, spacing: spacing) {
+            compactLiveButton()
+
+            compactEntry("我的", selected: false, id: "douyin.mine.top") { showMine = true }
+            compactEntry("消息", selected: false, dot: noticeUnread > 0, id: "douyin.messages.top") { setMessages(true) }
+            compactEntry(DYTab.follow.title, selected: tab == .follow, id: "douyin.tab.follow") { selectTab(.follow) }
+            compactRecommendEntry
+            .anchorPreference(key: DYFoldedRecommendBoundsKey.self, value: .bounds) { $0 }
+
+            // 仅保留旧按钮的布局占位，保证 ViewThatFits 的间距选择和所有 Tab 位置不变。
+            if immersiveLayout && hSize != .compact {
+                Button { showSearch = true } label: {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 20, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
+            } else {
+                Color.clear.frame(width: 44, height: 44)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func foldedSearch(in geo: GeometryProxy, safeInsets: EdgeInsets, recommend: CGRect) -> some View {
+        let profile = DYFoldedNavigationProfile()
+        let safe = EdgeInsets(top: max(safeInsets.top, geo.safeAreaInsets.top),
+                              leading: max(safeInsets.leading, geo.safeAreaInsets.leading),
+                              bottom: max(safeInsets.bottom, geo.safeAreaInsets.bottom),
+                              trailing: max(safeInsets.trailing, geo.safeAreaInsets.trailing))
+        let camera = foldedCameraRegion(in: geo) ?? profile.fallbackCamera(in: geo.size, safe: safe)
+        let frame = profile.searchFrame(size: geo.size, safe: safe, camera: camera, recommend: recommend)
+        return Group {
+            if let frame {
+                Button { showSearch = true } label: {
+                    Image(systemName: "magnifyingglass")
+                        .resizable().scaledToFit()
+                        // 跟顶栏 17pt 文字视觉等高；点击区仍是 44pt
+                        .fontWeight(.semibold)
+                        .frame(width: 20, height: 20)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .themeShadow(.mediaLabel)
+                .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
+                .position(x: frame.midX, y: frame.midY)
+            }
+        }
+    }
+
+    private func foldedCameraRegion(in geo: GeometryProxy) -> CGRect? {
+        guard #available(iOS 27.1, *) else { return nil }
+        var camera: CGRect?
+        for region in geo.reservedRegions(kind: .occlusion) where region.isActive {
+            let frame = region.frame
+            guard frame.width > 1, frame.height > 1,
+                  frame.minY < 140, frame.minX > geo.size.width * 0.5 else { continue }
+            camera = camera.map { $0.union(frame) } ?? frame
+        }
+        return camera
     }
 
     private func compactEntry(_ title: String, selected: Bool, dot: Bool = false, loading: Bool = false,
                               id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Text(title)
-                    .font(.system(size: 17, weight: selected ? .bold : .semibold))
-                    .lineLimit(1).fixedSize()
-                    .opacity(loading ? 0 : 1)
-                    .overlay { if loading { ProgressView().tint(.white) } }
-                    .overlay(alignment: .topTrailing) {
-                        if dot { Circle().fill(.red).frame(width: 7, height: 7).offset(x: 6, y: -2) }
-                    }
-                Capsule().fill(.white).frame(width: 22, height: 2.5).opacity(selected ? 1 : 0)
-            }
-            .foregroundStyle(.white.opacity(selected ? 1 : 0.72))
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
+            Text(title)
+                .font(.system(size: 17, weight: selected ? .bold : .semibold))
+                .lineLimit(1).fixedSize()
+                .opacity(loading ? 0 : 1)
+                .overlay { if loading { ProgressView().tint(.white) } }
+                .overlay(alignment: .topTrailing) {
+                    if dot { Circle().fill(.red).frame(width: 7, height: 7).offset(x: 6, y: -2) }
+                }
+                .foregroundStyle(.white.opacity(selected ? 1 : 0.72))
+                .frame(minWidth: 44, minHeight: 44)
+                .overlay(alignment: .bottom) {
+                    Capsule().fill(.white).frame(width: 22, height: 2.5).opacity(selected ? 1 : 0)
+                }
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(id)
@@ -2145,7 +2529,7 @@ struct DouyinFeedScreen: View {
                 })
             }
             // 消息只留图标，未读红点仍独立显示。
-            Button { showMessages = true } label: {
+            Button { setMessages(true) } label: {
                 Image(systemName: "bubble.left.and.bubble.right")
                     .font(.headline.weight(.medium))
                     .foregroundStyle(theme.media.onMedia.color(for: scheme).opacity(0.62))
@@ -2215,7 +2599,7 @@ struct DouyinFeedScreen: View {
 
     /// 顶栏「消息」。样式跟现有 topIcon，红暴液态按钮合并后会一起换。
     private var messageEntry: some View {
-        topIcon("bell", "douyin.messages") { showMessages = true }
+        topIcon("bell", "douyin.messages") { setMessages(true) }
             .overlay(alignment: .topTrailing) {
                 if noticeUnread > 0 {
                     Circle().fill(theme.status.danger.color(for: scheme))
@@ -2272,43 +2656,93 @@ struct DouyinFeedScreen: View {
                 .padding()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView(.vertical) {
-                    LazyVStack(spacing: 0) {
-                        ForEach(feed.items) { item in
-                            page(for: item)
-                                .containerRelativeFrame([.horizontal, .vertical])
-                                .id(item.id)
+                if #available(iOS 18.0, *) {
+                    recommendationPager
+                        .onScrollPhaseChange { _, phase in
+                            switch phase {
+                            case .tracking, .interacting:
+                                userScrolling = true
+                            case .idle:
+                                commitRecommendationScroll()
+                            default:
+                                break
+                            }
                         }
-                    }
-                    .scrollTargetLayout()
+                } else {
+                    recommendationPager
+                        .simultaneousGesture(DragGesture(minimumDistance: 8)
+                            .onChanged { value in
+                                guard draggingRecommendation ||
+                                    abs(value.translation.height) > abs(value.translation.width) else { return }
+                                scrollEndTask?.cancel()
+                                draggingRecommendation = true
+                                userScrolling = true
+                            }
+                            .onEnded { _ in
+                                guard draggingRecommendation else { return }
+                                draggingRecommendation = false
+                                scheduleRecommendationScrollCommit()
+                            })
                 }
-                .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $scrollID, anchor: .center)
-                .onAppear { scrollID = currentID }
-                .simultaneousGesture(DragGesture(minimumDistance: 8)
-                    .onChanged { value in
-                        if abs(value.translation.height) > abs(value.translation.width) {
-                            if !userScrolling { dragStartID = currentID }
-                            scrollEndTask?.cancel(); userScrolling = true
-                        }
-                    }
-                    .onEnded { _ in
-                        // 下拉不再触发刷新（顶部点击/轻扫会误判成刷新）；刷新走「更多 → 刷新推荐」。
-                        dragStartID = nil
-                        scrollEndTask = Task {
-                            try? await Task.sleep(nanoseconds: 800_000_000)
-                            if !Task.isCancelled { userScrolling = false }
-                        }
-                    })
-                .onChange(of: scrollID) { _, id in
-                    guard let id, feed.items.contains(where: { $0.id == id }) else { return }
-                    if userScrolling { currentID = id }
-                    else if id != currentID { scrollID = currentID }
-                }
-                .scrollIndicators(.hidden)
-                .ignoresSafeArea()
             }
         }
+    }
+
+    private var recommendationPager: some View {
+        ScrollView(.vertical) {
+            LazyVStack(spacing: 0) {
+                ForEach(feed.items) { item in
+                    page(for: item)
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(item.id)
+                }
+            }
+            .scrollTargetLayout()
+            .onGeometryChange(for: CGFloat.self) {
+                $0.frame(in: .named("recommendationPager")).minY
+            } action: { _ in
+                if #unavailable(iOS 18.0) { scheduleRecommendationScrollCommit() }
+            }
+        }
+        .coordinateSpace(name: "recommendationPager")
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $scrollID, anchor: .center)
+        .onAppear { scrollID = currentID }
+        .onDisappear { cancelRecommendationScroll() }
+        .onChange(of: scrollID) { _, id in
+            guard let id, feed.items.contains(where: { $0.id == id }) else { return }
+            if !userScrolling, id != currentID { scrollID = currentID }
+        }
+        .scrollIndicators(.hidden)
+        .ignoresSafeArea()
+    }
+
+    // iOS 17 has no scroll phase callback. Wait for offset changes to stop after release.
+    private func scheduleRecommendationScrollCommit() {
+        guard userScrolling, !draggingRecommendation else { return }
+        scrollEndTask?.cancel()
+        scrollEndTask = Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            commitRecommendationScroll()
+        }
+    }
+
+    private func commitRecommendationScroll() {
+        guard userScrolling else { return }
+        cancelRecommendationScroll()
+        guard let id = scrollID, feed.items.contains(where: { $0.id == id }) else {
+            scrollID = currentID
+            return
+        }
+        if id != currentID { currentID = id }
+    }
+
+    private func cancelRecommendationScroll() {
+        scrollEndTask?.cancel()
+        scrollEndTask = nil
+        draggingRecommendation = false
+        userScrolling = false
     }
 
     /// 单页构造拆成独立函数：参数太多，写在 ForEach 里会让类型检查超时。
@@ -2318,7 +2752,7 @@ struct DouyinFeedScreen: View {
         return DYVideoPage(item: item,
                            isCurrent: active,
                            insets: insets,
-                           resume: resume[item.id],
+                           resume: resume.map[item.id],
                            liked: feed.liked.contains(item.id),
                            collected: feed.collected.contains(item.id),
                            onLike: { toggleLike(item.id, force: nil) },
@@ -2327,14 +2761,18 @@ struct DouyinFeedScreen: View {
                            onComments: { withAnimation(.snappy) { showComments.toggle() } },
                            onSearch: { showSearch = true },
                            onAuthor: { authorTarget = item.author },
-                           onSavePosition: { resume[item.id] = $0; saveSession() },
+                           onSavePosition: { resume.map[item.id] = $0; saveSession() },
                            preloader: preloader,
                            bridge: bridge,
                            onToast: { showToast($0) },
                            onDislike: { dislike(item.id) },
                            moreExtras: extras,
                            onEnded: { playNext(after: item.id) },
-                           onSwipeRightOverride: showComments ? { withAnimation(.snappy) { showComments = false } } : nil)
+                           // 跟顶栏顺序一致（关注 | 推荐 | 消息）：手指往左滑 → 右边的消息；往右滑 → 左边的关注
+                           // （评论开着时右滑先收评论）
+                           onSwipeLeftOverride: { setMessages(true) },
+                           onSwipeRightOverride: showComments ? { withAnimation(.snappy) { showComments = false } }
+                               : { selectTab(.follow) })
     }
 
     /// 点赞：先本地乐观更新，再调抖音网页接口，按服务端返回决定成败
@@ -2376,11 +2814,11 @@ struct DouyinFeedScreen: View {
     private func dislike(_ id: String) {
         guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
         let next = i + 1 < feed.items.count ? feed.items[i + 1].id : (i > 0 ? feed.items[i - 1].id : nil)
-        scrollEndTask?.cancel(); userScrolling = false
         showComments = false
+        cancelRecommendationScroll()
         if currentID == id { currentID = next; scrollID = next }
         feed.items.remove(at: i)
-        resume[id] = nil
+        resume.map[id] = nil
         saveSession()
         showToast("将减少此类推荐")
         Task {
@@ -2395,7 +2833,7 @@ struct DouyinFeedScreen: View {
                 showToast("「不感兴趣」同步失败：\(error.localizedDescription)")
             }
         }
-        if next == nil { Task { await feed.loadMore(bridge); currentID = feed.items.first?.id; scrollID = currentID } }
+        if next == nil { Task { await feed.loadMore(bridge); currentID = feed.items.first?.id } }
     }
 
     /// 收藏 / 取消收藏（同步到抖音账号的「收藏」）
@@ -2447,6 +2885,12 @@ struct DouyinFeedScreen: View {
             }
             .disabled(refreshing)
             Menu {
+                Picker("界面布局", selection: layoutChoice) {
+                    // Text("A · 经典布局").tag(0)   // 已下线，见 immersiveLayout 的说明
+                    Text("B · 沉浸布局").tag(1)
+                    Text("C · 通透布局").tag(2)
+                }
+                .accessibilityIdentifier("douyin.layout")
                 Menu {
                     Toggle(isOn: $autoNext) { Label("自动连播", systemImage: "play.square.stack") }
                     Toggle(isOn: $muted) { Label("静音", systemImage: "speaker.slash") }
@@ -2510,11 +2954,60 @@ enum DYTab: CaseIterable { case follow, recommend, live
     }
 }
 
+/// B 的操作组采用系统 Liquid Glass；A 保持原来的无底板外观。
+private struct DYImmersiveControlGlass: ViewModifier {
+    let enabled: Bool
+    /// 内屏按钮直接压在画面上：用通透玻璃
+    var clear = false
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.ddGlassCapsule(clear: clear)
+        } else {
+            content
+        }
+    }
+}
+
 // MARK: - 单页
 
 struct DYVideoPage: View {
+    /// A · 经典布局已下线：固定走 B / C。A 的分支代码（各处 immersiveLayout 为 false 的那一半）
+    /// 原样留在源码里，只是不再可达；要恢复就把这一行换回
+    /// @AppStorage("douyin_immersive_layout_v1") private var immersiveLayout = false，并把设置里的 A 选项放回去。
+    private let immersiveLayout = true
+    /// C · 通透布局：在 B 的基础上，外屏也用 B 内屏那套（画面铺满整屏，顶栏 / 按钮列玻璃压在画面上）。
+    /// 只在 immersiveLayout 为 true 时有意义。
+    @AppStorage("douyin_overlay_layout_v1") private var overlayLayout = false
+    @Environment(\.dyFeedSafeInsets) private var feedSafeInsets
+    private var presentationRailWidth: CGFloat {
+        immersiveLayout ? max(hSize == .compact ? 70 : 78, feedSafeInsets.trailing, insets.trailing) : 0
+    }
+    /// B：外屏右侧系统栏（时间 / 电量 / 前摄）的竖轴不在安全区条带正中，而是距屏幕右缘约 49pt
+    /// （真机实测：屏宽 466、条带 84，系统轴 x≈417）。真机上 reservedRegions(.occlusion) 为空，
+    /// 拿不到摄像头位置，所以按实测轴线把按钮列从条带中心挪过去。
+    private var systemAxisShift: CGFloat {
+        guard outerStripLayout else { return 0 }
+        return presentationRailWidth / 2 - 49
+    }
+    /// B + 外屏（右侧有系统条）：底部 34pt 的 Home 指示条留白不再保留，进度条和文案贴到底。
+    private var outerStripLayout: Bool {
+        immersiveLayout && max(feedSafeInsets.trailing, insets.trailing) >= 80
+    }
+    private var pageBottomInset: CGFloat { outerStripLayout ? 0 : insets.bottom }
+    /// 画面给按钮列让出的宽度。B 外屏：让出整条系统栏；B 内屏 / C：画面铺满整屏，按钮列（玻璃）直接压在画面上。
+    private var fullBleed: Bool { hSize != .compact || overlayLayout }
+    private var mediaTrailingInset: CGFloat { fullBleed ? 0 : presentationRailWidth }
+    private var presentationLeadingInset: CGFloat {
+        immersiveLayout ? max(feedSafeInsets.leading, insets.leading) : 0
+    }
     @Environment(\.horizontalSizeClass) private var hSize
-    private var railWidth: CGFloat { hSize == .compact ? 50 : 54 }
+    /// C：整列收窄到 44pt（外屏原来 50、内屏 54；只收到 48 时外屏几乎看不出差别）；纵向间距和图标大小不变
+    private var slimRail: Bool { immersiveLayout && overlayLayout }
+    private var railWidth: CGFloat { slimRail ? 44 : (hSize == .compact ? 50 : 54) }
+    private var railButtonSide: CGFloat { slimRail ? 44 : 50 }
+    private var railAvatarSide: CGFloat { 40 }
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     let item: DYAweme
@@ -2555,8 +3048,9 @@ struct DYVideoPage: View {
     @State private var danmakuSending = false
     @FocusState private var danmakuFocused: Bool
     @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
-    /// 外屏评论打开、视频缩到面板上方时只留画面
-    @Environment(\.dyCommentsDocked) private var docked
+    // ⚠️ 这里不要读 \.dyCommentsDocked：一读，开关评论时整页 body 重算，播放器外壳、
+    // 「竖视频铺满」的尺寸和画面层都会跟着重新算一遍（收起评论时的那一下卡顿）。
+    // 需要跟随 docked 的部分用 DYDockedHidden / DYDockedObserver 自己读。
 
     init(item: DYAweme, isCurrent: Bool, insets: EdgeInsets, resume: Double?, liked: Bool, collected: Bool,
          onLike: @escaping () -> Void, onCollect: @escaping () -> Void, onDoubleTap: @escaping () -> Void,
@@ -2581,47 +3075,62 @@ struct DYVideoPage: View {
     var body: some View {
         let fg = theme.media.onMedia.color(for: scheme)
         ZStack(alignment: .bottomLeading) {
-            if item.images.isEmpty, let s = item.play, let remote = URL(string: s) {
-                // 只用「整条缓存」或「在线流」：不再走头部缓存 + 接续（那一下切换必然闪/卡）
-                let url = DYVideoCache.localURL(item.id) ?? remote
-                // 复用影库播放器：横滑快进（带预览缩略图）、双击、长按 2 倍速、竖滑切视频、底部可拖进度条、VLC 兜底
-                PlayerPage.external(id: item.id, title: item.desc, url: url, durationSec: item.duration,
-                                    isActive: isCurrent, topInset: insets.top, bottomInset: insets.bottom,
-                                    resumePosition: resume, compactChrome: true,
-                                    preparedPlayer: { preloader.take(item.id) },
+            // One stable media subtree for A and B: resizing must not replace the player.
+            Group {
+                if item.images.isEmpty, let s = item.play, let remote = URL(string: s) {
+                    // 只用「整条缓存」或「在线流」：不再走头部缓存 + 接续（那一下切换必然闪/卡）
+                    let url = DYVideoCache.localURL(item.id) ?? remote
+                    // 复用影库播放器：横滑快进（带预览缩略图）、双击、长按 2 倍速、竖滑切视频、底部可拖进度条、VLC 兜底
+                    PlayerPage.external(id: item.id, title: item.desc, url: url, durationSec: item.duration,
+                                        isActive: isCurrent, topInset: insets.top, bottomInset: pageBottomInset,
+                                        resumePosition: resume, compactChrome: true,
+                                        preparedPlayer: { preloader.take(item.id) },
+                                        onEnded: autoNext ? onEnded : nil,
+                                        onDoubleTap: likeFromDoubleTap,
+                                        onSavePosition: onSavePosition, onClose: {}, fillWidth: hSize == .compact && item.isTallFrame,
+                                        danmaku: danmakuOn ? danmaku : [],
+                                        altURL: item.playAlt.flatMap(URL.init(string:)),
+                                        quality: item.q,
+                                        fastURL: item.playFast.flatMap(URL.init(string:)),
+                                        posterURL: item.cover.flatMap(URL.init(string:)),
+                                        videoAspect: item.height > 0 ? item.width / item.height : 0,
+                                        headEndSeconds: nil,
+                                        continuationURL: nil,
+                                        onSwipeLeft: { if isCurrent { (onSwipeLeftOverride ?? onAuthor)() } },
+                                        onSwipeRight: onSwipeRightOverride,
+                                        // 外屏竖视频铺满（左右裁一点、居中），不再贴左
+                                        fillCropLimit: hSize == .compact ? 0.3 : 0.18,
+                                        // 画面横滑不再快进，只用来切 Tab；快进走底部进度条
+                                        dragSeek: false)
+                } else {
+                    DYImagePostView(item: item, isCurrent: isCurrent, bottomInset: pageBottomInset,
                                     onEnded: autoNext ? onEnded : nil,
-                                    onDoubleTap: {
-                                        onDoubleTap()
-                                        heart = true
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { heart = false }
-                                    },
-                                    onSavePosition: onSavePosition, onClose: {}, fillWidth: hSize == .compact && item.isTallFrame,
-                                    danmaku: danmakuOn ? danmaku : [],
-                                    altURL: item.playAlt.flatMap(URL.init(string:)),
-                                    quality: item.q,
-                                    fastURL: item.playFast.flatMap(URL.init(string:)),
-                                    posterURL: item.cover.flatMap(URL.init(string:)),
-                                    videoAspect: item.height > 0 ? item.width / item.height : 0,
-                                    headEndSeconds: nil,
-                                    continuationURL: nil,
-                                    onSwipeLeft: { if isCurrent { (onSwipeLeftOverride ?? onAuthor)() } },
-                                    onSwipeRight: onSwipeRightOverride,
-                                    // 外屏竖视频铺满（左右裁一点、居中），不再贴左
-                                    fillCropLimit: hSize == .compact ? 0.3 : 0.18)
-            } else {
-                DYImagePostView(item: item, isCurrent: isCurrent, bottomInset: insets.bottom,
-                                onEnded: autoNext ? onEnded : nil,
-                                preparedMusic: { preloader.take(item.id) })
+                                    preparedMusic: { preloader.take(item.id) })
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded {
+                            likeFromDoubleTap()
+                        })
+                }
+
             }
+            .clipShape(DYFeedMediaBoundary(enabled: immersiveLayout))
+            .padding(.leading, presentationLeadingInset)
+            .padding(.trailing, mediaTrailingInset)
+
+            Color.black.opacity(immersiveLayout ? 0.78 : 0)
+                .frame(width: mediaTrailingInset)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                .allowsHitTesting(false)
 
             VStack {
                 Spacer(minLength: 0)
                 LinearGradient(colors: [.clear, .black.opacity(0.18), .black.opacity(0.62)],
                                startPoint: .top, endPoint: .bottom)
-                    .frame(height: hSize == .compact ? 230 : 170)
+                    .frame(height: immersiveLayout ? 300 : (hSize == .compact ? 230 : 170))
             }
-            .opacity(docked ? 0 : 1)
+            .padding(.trailing, mediaTrailingInset)
             .allowsHitTesting(false)
+            .modifier(DYDockedHidden(hitTestWhenShown: false))
             if heart {
                 Image(systemName: "heart.fill")
                     .font(.system(size: theme.typography.pointSize(.splash)))
@@ -2632,32 +3141,39 @@ struct DYVideoPage: View {
                     .allowsHitTesting(false)
             }
 
-            // 左下信息贴近进度条；右侧按钮维持原高度，不跟随标题下移。
+            // B：文案区与操作列共用底边，让末尾的「更多」与左侧文案对齐。
+            // A：保留原有操作列高度。
             HStack(alignment: .bottom, spacing: 12) {
                 info(fg)
+                    .frame(maxWidth: immersiveLayout ? .infinity : nil, alignment: .leading)
                 Spacer(minLength: 0)
                 actions(fg)
                     .modifier(DYRailReservedNudge())
                     // 外屏：按钮栏往右贴（列中心距右缘约 35pt，原来约 48pt）
-                    .offset(x: hSize == .compact ? 4 : 0)
+                    .offset(x: immersiveLayout ? systemAxisShift : (hSize == .compact ? 4 : 0))
+                    // B uses the same measured trailing region as the media boundary.
+                    // Cancel the HStack's outer trailing padding, then center every control
+                    // in that region rather than at a fixed 39pt distance from the edge.
+                    .frame(width: immersiveLayout ? presentationRailWidth : nil)
+                    .padding(.trailing, immersiveLayout ? -12 : 0)
                     // 按钮栏固定高度：图集这一行底部少 12pt，这里补回去，视频/图集切换时按钮不跳
-                    .padding(.bottom, item.images.isEmpty ? 56 : 68)
+                    .padding(.bottom, immersiveLayout ? 0 : (item.images.isEmpty ? 56 : 68))
+                    // B：「更多」(50pt) 与左侧文案两行（标题 + 发布信息，约 38pt）中线对齐，而不是底边对齐
+                    .alignmentGuide(.bottom) { d in d[.bottom] - (immersiveLayout ? (railButtonSide - 38) / 2 : 0) }
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 36 : 24))
-            .opacity(docked ? 0 : 1)
-            .allowsHitTesting(!docked)
+            .padding(.bottom, max(pageBottomInset, outerStripLayout ? 8 : 18) + (item.images.isEmpty ? 36 : 24))
+            .modifier(DYDockedHidden(hitTestWhenShown: true))
         }
         .overlay(alignment: .bottom) {
-            if showDanmakuInput { danmakuBar.padding(.bottom, max(insets.bottom, 12) + 6) }
+            if showDanmakuInput { danmakuBar.padding(.bottom, max(pageBottomInset, 12) + 6) }
         }
         .fullScreenCover(isPresented: $showShare) {
             DYForwardScreen(item: item).presentationBackground(.clear)
         }
         .animation(.snappy, value: heart)
-        .animation(.snappy, value: docked)
         .onChange(of: isCurrent) { _, c in if !c { showDanmakuInput = false } }
-        .onChange(of: docked) { _, d in if d { showDanmakuInput = false } }
+        .modifier(DYDockedObserver { showDanmakuInput = false })
         .task(id: isCurrent) {
             guard isCurrent, let bridge else { return }
             // Skip videos the user flicks past; never await this work before playback.
@@ -2677,6 +3193,14 @@ struct DYVideoPage: View {
                 DYLiveModel.log("DDDM id=\(item.id) error=\(error)")
             }
         }
+    }
+
+    /// 视频与图集共用「强制点赞」回调；重复双击不会取消已有的赞。
+    private func likeFromDoubleTap() {
+        guard isCurrent else { return }
+        onDoubleTap()
+        heart = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { heart = false }
     }
 
     private var danmakuBar: some View {
@@ -2748,13 +3272,16 @@ struct DYVideoPage: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Button(action: onAuthor) {
-                    Text(item.author.name).font(.footnote.weight(.semibold)).foregroundStyle(fg).lineLimit(1)
-                        .frame(minHeight: 26, alignment: .leading)
+                    HStack(spacing: 8) {
+                        // 作者名比文案（13pt 常规）大一档并加粗，一眼能和下面的文案分开
+                        Text(item.author.name).font(.callout.weight(.bold)).foregroundStyle(fg).lineLimit(1)
+                            .frame(minHeight: 26, alignment: .leading)
+                    }
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.author")
             }
-            if let metadata = item.metadataText() {
+            if !immersiveLayout, let metadata = item.metadataText() {
                 Text(metadata)
                     .font(.caption)
                     .foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
@@ -2766,8 +3293,14 @@ struct DYVideoPage: View {
                 DYExpandableTitle(text: item.desc, foreground: fg,
                                   secondary: theme.media.onMediaSecondary.color(for: scheme))
             }
+            if immersiveLayout, let metadata = item.metadataText() {
+                Text(metadata).font(.caption)
+                    .foregroundStyle(theme.media.onMediaSecondary.color(for: scheme))
+                    .lineLimit(1)
+                    .accessibilityIdentifier("douyin.video.metadata")
+            }
         }
-        .frame(maxWidth: 380, alignment: .leading)
+        .frame(maxWidth: immersiveLayout ? .infinity : 380, alignment: .leading)
         .themeShadow(.mediaLabel)
     }
 
@@ -2779,7 +3312,7 @@ struct DYVideoPage: View {
                     Image(systemName: "chevron.backward")
                         .font(.title2.weight(.medium))
                         .foregroundStyle(fg)
-                        .frame(width: 50, height: 50)
+                        .frame(width: railButtonSide, height: railButtonSide)
                 }
                 .buttonStyle(.plain)
                 .ddGlassCapsule()
@@ -2790,7 +3323,7 @@ struct DYVideoPage: View {
                 CachedAsyncImage(url: item.author.avatar.flatMap(URL.init(string:))) { img in
                     img.resizable().scaledToFill()
                 } placeholder: { theme.media.chromeFill.color(for: scheme) }
-                .frame(width: 40, height: 40)
+                .frame(width: railAvatarSide, height: railAvatarSide)
                 .clipShape(Circle())
                 .overlay(Circle().stroke(fg.opacity(0.9), lineWidth: 1))
                 .frame(width: 54, height: 48)
@@ -2805,17 +3338,20 @@ struct DYVideoPage: View {
             }
             .padding(.bottom, 6)
             VStack(spacing: 6) {
-                railItem(liked ? "heart.fill" : "heart", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
+                // 抖音式实心图标：未点时白色实心，点了才变色（赞变红、收藏变黄）
+                railItem("heart.fill", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
                          tint: liked ? theme.status.danger.color(for: scheme) : fg, "douyin.like", onLike)
-                railItem("ellipsis.bubble", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
-                railItem(collected ? "star.fill" : "star", DYFormat.count(item.stats.collect + (collected ? 1 : 0)),
+                railItem("ellipsis.bubble.fill", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
+                railItem("star.fill", DYFormat.count(item.stats.collect + (collected ? 1 : 0)),
                          tint: collected ? theme.status.warning.color(for: scheme) : fg, "douyin.collect", onCollect)
-                railItem("arrowshape.turn.up.right", "", tint: fg, "douyin.share", { showShare = true })
+                railItem("arrowshape.turn.up.right.fill", "", tint: fg, "douyin.share", { showShare = true })
             }
             .padding(.vertical, 8)
             .frame(width: railWidth)
+            .modifier(DYImmersiveControlGlass(enabled: immersiveLayout, clear: fullBleed))
             .frame(width: 54) // 保留列中心，与右侧系统信号栏竖直对齐
             moreMenu(fg)
+                .modifier(DYImmersiveControlGlass(enabled: immersiveLayout, clear: fullBleed))
         }
         .themeShadow(.mediaLabel)
     }
@@ -2875,9 +3411,9 @@ struct DYVideoPage: View {
             Image(systemName: "ellipsis")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(fg)
-                .frame(width: 50, height: 50)
+                .frame(width: railButtonSide, height: railButtonSide)
                 .contentShape(Circle())
-                .frame(width: 54)
+                .frame(width: slimRail ? railButtonSide : 54)
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
@@ -3106,9 +3642,33 @@ enum DYFormat {
     }
 }
 
+/// 外屏评论打开、视频缩到面板上方时隐藏（只留画面）。自己读环境值：
+/// docked 变化只重算这个 modifier，不会带着整个视频页和播放器重算。
+private struct DYDockedHidden: ViewModifier {
+    @Environment(\.dyCommentsDocked) private var docked
+    let hitTestWhenShown: Bool
+    func body(content: Content) -> some View {
+        content
+            .opacity(docked ? 0 : 1)
+            .allowsHitTesting(hitTestWhenShown && !docked)
+            .animation(.snappy, value: docked)
+    }
+}
+
+/// 视频被评论面板挤上去的那一刻通知一声（收掉弹幕输入框等）
+private struct DYDockedObserver: ViewModifier {
+    @Environment(\.dyCommentsDocked) private var docked
+    let onDocked: () -> Void
+    func body(content: Content) -> some View {
+        content.onChange(of: docked) { _, d in if d { onDocked() } }
+    }
+}
+
 // MARK: - 评论
 
 struct DYCommentPanel: View {
+    @Environment(\.dyCommentPanelReady) private var panelReady
+    @Environment(\.dyCommentPullDismiss) private var pullDismiss
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     let bridge: DouyinBridge
@@ -3151,7 +3711,7 @@ struct DYCommentPanel: View {
                 Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论").font(.subheadline.weight(.semibold))
                 Spacer()
                 if let onClose {
-                    Button(action: onClose) {
+                    Button(action: pullDismiss?.close ?? onClose) {
                         Image(systemName: "xmark").font(.subheadline.weight(.semibold))
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
@@ -3179,13 +3739,19 @@ struct DYCommentPanel: View {
                             .accessibilityIdentifier("douyin.comments.retry")
                     } else if hasMore {
                         ProgressView().frame(maxWidth: .infinity)
-                            .task { await load() }
+                            .onChange(of: panelReady) { _, ready in
+            // 外屏面板关闭后仍复用；显式撤销输入焦点，避免隐藏输入框留住键盘。
+            if !ready && pullDismiss != nil { inputFocused = false }
+        }
+        .task(id: panelReady) { if panelReady { await load() } }
                     } else if items.isEmpty {
                         Text("还没有评论").font(.footnote).foregroundStyle(.themeTextSecondary).frame(maxWidth: .infinity)
                     }
                 }
                 .padding(16)
+                .background(DYCommentScrollPullObserver(callbacks: pullDismiss))
             }
+            .accessibilityIdentifier("douyin.comments.list")
             if !relatedWords.isEmpty {
                 Divider()
                 ScrollView(.horizontal) {
@@ -3208,11 +3774,25 @@ struct DYCommentPanel: View {
             Divider()
             inputBar
         }
-        .background(GlassBackground())
+        .background {
+            if pullDismiss != nil {
+                // 外屏视频正在缩放；不再对播放画面实时采样、模糊整个评论面板。
+                Color(uiColor: .systemBackground)
+            } else {
+                GlassBackground()
+            }
+        }
         // Match the user's verified official right-swipe-to-close behavior.
-        .background(DYSwipeDismiss(direction: .right, enabled: onClose != nil && relatedQuery == nil) { onClose?() })
+        .background(DYSwipeDismiss(direction: .right, enabled: onClose != nil && relatedQuery == nil) {
+            if let dockClose = pullDismiss?.close { dockClose() } else { onClose?() }
+        })
         .modifier(DYRailReservedNudge())
-        .task(id: aweme.id) { relatedWords = await bridge.relatedSearch(for: aweme) }
+        .task(id: panelReady) {
+            guard panelReady else { return }
+            let words = await bridge.relatedSearch(for: aweme)
+            guard !Task.isCancelled else { return }
+            relatedWords = words
+        }
         .fullScreenCover(item: $relatedQuery) { query in
             DYRelatedSearchScreen(bridge: bridge, word: query.word)
         }
@@ -3296,7 +3876,10 @@ struct DYCommentPanel: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .task { await DYEmojiStore.shared.load(bridge: bridge) }
+        .task(id: panelReady) {
+            guard panelReady else { return }
+            await DYEmojiStore.shared.load(bridge: bridge)
+        }
     }
 
     /// 拉「我关注的人」给 @ 面板用

@@ -21,13 +21,13 @@
 		48F46B135907F902C9B20475 /* CachedAsyncImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3213D784302224EDB7868AF3 /* CachedAsyncImage.swift */; };
 		4FD061DC405BE48E593970FD /* DouyinLiveRoom.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE510B8A54EF604B236B9FF8 /* DouyinLiveRoom.swift */; };
 		5E559F14A34B0BC320D02B20 /* DouyinWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5AFA52547E516238F34D3A7 /* DouyinWebView.swift */; };
-		A1F00D0FEED0C0DE00000001 /* DouyinFeedPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */; };
 		64760847CD94FEE469039F33 /* DouyinFeedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79D68085CA0B47F08B3A1535 /* DouyinFeedView.swift */; };
 		64E988A9D801D0D01BB6ECAD /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 7F33EB1CF5B949489AA77586 /* Assets.xcassets */; };
 		74B67BFBE35241CE256E7D36 /* DouyinRelatedSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 366286F958759FA9BE49695E /* DouyinRelatedSearch.swift */; };
 		7F8AAD69DE737D7DD8DEBA42 /* DouyinFeatureProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = F08DC47FE80818A237A7BDE3 /* DouyinFeatureProbe.swift */; };
 		844D4A4311515599F9DF42DE /* DouDuoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DEA756C4CD3920F4920BACF /* DouDuoApp.swift */; };
 		85C30C1C9411C32D14761E7A /* DouyinExtras.swift in Sources */ = {isa = PBXBuildFile; fileRef = D66F335DE5A601EA019AD61E /* DouyinExtras.swift */; };
+		A1F00D0FEED0C0DE00000001 /* DouyinFeedPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */; };
 		AAF87B9A920594ED30D856E2 /* DouyinCommentApiProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A92ADB714F1273A5B9648B /* DouyinCommentApiProbe.swift */; };
 		AF2F0EB751A5DBBC824C6357 /* DouyinPeopleCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 001C015957CC2755309F4EE5 /* DouyinPeopleCache.swift */; };
 		B072D11672770FB4836781C5 /* PlayerGestureView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67D760242AE376C515972D58 /* PlayerGestureView.swift */; };
@@ -63,7 +63,6 @@
 		54934A09C570DF5D3F0042DC /* DouyinExpandableTitle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinExpandableTitle.swift; sourceTree = "<group>"; };
 		67255D497584391EEC6C07A2 /* DouDuoUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = DouDuoUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		67D760242AE376C515972D58 /* PlayerGestureView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerGestureView.swift; sourceTree = "<group>"; };
-		A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinFeedPipeline.swift; sourceTree = "<group>"; };
 		79D68085CA0B47F08B3A1535 /* DouyinFeedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinFeedView.swift; sourceTree = "<group>"; };
 		7DEA756C4CD3920F4920BACF /* DouDuoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouDuoApp.swift; sourceTree = "<group>"; };
 		7F33EB1CF5B949489AA77586 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -71,6 +70,7 @@
 		9015DABC86424C9FA5DDBA1E /* VLCPlayerBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VLCPlayerBridge.swift; sourceTree = "<group>"; };
 		960FE5102A00176B7013B057 /* ShortVideoPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortVideoPlayer.swift; sourceTree = "<group>"; };
 		9E79B1B7855114828E14FCBA /* DouyinDuoLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinDuoLayout.swift; sourceTree = "<group>"; };
+		A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinFeedPipeline.swift; sourceTree = "<group>"; };
 		A6754C7BC29DD87FCABDB757 /* DouDuoUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouDuoUITests.swift; sourceTree = "<group>"; };
 		B354D23E6C4EF0CC47B0C165 /* VLCKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = VLCKit; path = Vendor/VLCKit; sourceTree = SOURCE_ROOT; };
 		BC6C461FDA2AC796478F78BD /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };

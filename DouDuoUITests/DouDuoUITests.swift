@@ -68,6 +68,11 @@ final class DouDuoUITests: XCTestCase {
         XCTAssertTrue(app.buttons["douyin.forward.action.groups"].exists)
         attach(app, "friend-forward-native-SYNTHETIC-layout-no-send")
         contact.tap()
+        app.buttons["douyin.forward.contact.layout-fixture-2"].tap()
+        let send = app.buttons["douyin.forward.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 5))
+        XCTAssertEqual(send.label, "发送给 2 人")
+        send.tap()
         XCTAssertTrue(app.alerts["确认转发"].waitForExistence(timeout: 5))
         app.alerts.buttons["取消"].tap()
         let panel = app.otherElements["douyin.forward.panel"]
@@ -407,6 +412,48 @@ final class DouDuoUITests: XCTestCase {
         }
         attach(app, "rail-comment-above-collect")
         print("DDRAIL: order=like,comment,collect,search; gaps=\(likeToComment)/\(commentToCollect)")
+    }
+
+    /// 外屏：从评论列表顶部下拉，而不是拖标题栏，应该跟手收起。
+    func testOuterCommentsPullDownFromList() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let current = app.staticTexts["douyin.currentID"]
+        XCTAssertTrue(current.waitForExistence(timeout: 40))
+        let ready = NSPredicate(format: "label != '-'")
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: ready, evaluatedWith: current)], timeout: 60), .completed)
+        let entry = try XCTUnwrap(app.buttons.matching(identifier: "douyin.comments")
+            .allElementsBoundByIndex.first { $0.isHittable })
+        entry.tap()
+        let dock = app.descendants(matching: .any).matching(identifier: "douyin.comments.dock").firstMatch
+        guard dock.waitForExistence(timeout: 5) else {
+            throw XCTSkip("此测试需在外屏窄窗口运行")
+        }
+        let list = app.scrollViews["douyin.comments.list"]
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        let videoID = current.label
+        // 慢速短拉应回弹，不能误关闭；触点在正文内，避开标题栏。
+        list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+            .press(forDuration: 0.05, thenDragTo: list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.26)),
+                   withVelocity: .slow, thenHoldForDuration: 0.3)
+        XCTAssertTrue(dock.exists)
+        list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.15))
+            .press(forDuration: 0.05, thenDragTo: list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)),
+                   withVelocity: .slow, thenHoldForDuration: 0.1)
+        let closed = NSPredicate(format: "exists == false")
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: closed, evaluatedWith: dock)], timeout: 5), .completed)
+        XCTAssertEqual(current.label, videoID, "关闭评论不能切换视频")
+        // 同一视频的面板复用后，关闭按钮仍必须生效，不能留下遮挡播放区的透明层。
+        for _ in 0..<2 {
+            entry.tap()
+            XCTAssertTrue(dock.waitForExistence(timeout: 5))
+            let close = app.buttons["douyin.comments.close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 5))
+            close.tap()
+            XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: closed, evaluatedWith: dock)], timeout: 5), .completed)
+            XCTAssertTrue(entry.isHittable)
+            XCTAssertEqual(current.label, videoID)
+        }
     }
 
     func testCommentImages() throws {

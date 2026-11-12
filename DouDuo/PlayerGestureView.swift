@@ -25,6 +25,12 @@ struct PlayerGestureView: UIViewRepresentable {
     /// Feed navigation takes left swipes; bottom progress-bar seeking stays independent.
     var onSwipeLeft: (() -> Void)? = nil
     var onSwipeRight: (() -> Void)? = nil
+    /// false：画面上的横向拖动不再快进（抖音流里横滑只用来切 Tab）；底部进度条照常可拖
+    var dragSeek = true
+    /// 导航横滑过程中跟手上报：(横向位移，已按方向截断；方向 -1 左 / +1 右)
+    var onSwipeDrag: ((CGFloat, CGFloat) -> Void)? = nil
+    /// 导航横滑没达到阈值、松手回弹
+    var onSwipeCancel: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -132,14 +138,26 @@ struct PlayerGestureView: UIViewRepresentable {
         @objc func handlePan(_ g: UIPanGestureRecognizer) {
             guard let v = view else { return }
             if navigationDirection != 0 {
-                if g.state == .ended {
-                    let delta = g.translation(in: v)
+                let dir = navigationDirection
+                let delta = g.translation(in: v)
+                switch g.state {
+                case .began, .changed:
+                    parent.onSwipeDrag?(dir < 0 ? min(0, delta.x) : max(0, delta.x), dir)
+                case .ended:
                     let threshold = max(60, min(120, v.bounds.width * 0.15))
-                    if delta.x * navigationDirection >= threshold, abs(delta.x) > abs(delta.y) * 1.2 {
-                        if navigationDirection < 0 { parent.onSwipeLeft?() } else { parent.onSwipeRight?() }
+                    // 拖过阈值，或者同方向快速一甩（位移不大也算）
+                    let flung = g.velocity(in: v).x * dir > 500 && delta.x * dir > 12
+                    if (delta.x * dir >= threshold && abs(delta.x) > abs(delta.y) * 1.2) || flung {
+                        if dir < 0 { parent.onSwipeLeft?() } else { parent.onSwipeRight?() }
+                    } else {
+                        parent.onSwipeCancel?()
                     }
+                    navigationDirection = 0
+                case .cancelled, .failed:
+                    parent.onSwipeCancel?()
+                    navigationDirection = 0
+                default: break
                 }
-                if g.state == .ended || g.state == .cancelled || g.state == .failed { navigationDirection = 0 }
                 return
             }
             switch g.state {
@@ -168,6 +186,8 @@ struct PlayerGestureView: UIViewRepresentable {
             if abs(d.x) < 0.5, abs(d.y) < 0.5 { return false }
             navigationDirection = abs(d.x) > abs(d.y) * 1.2
                 ? (d.x < 0 && parent.onSwipeLeft != nil ? -1 : d.x > 0 && parent.onSwipeRight != nil ? 1 : 0) : 0
+            // 关了拖动快进：这个方向没有导航动作就不接手，手势原样漏给外层
+            if !parent.dragSeek, navigationDirection == 0 { return false }
             if parent.verticalFirst {
                 // 横向要比竖向大 20% 才算快进，其余一律交给分页切视频
                 return abs(d.x) > abs(d.y) * 1.2

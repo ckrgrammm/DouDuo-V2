@@ -4,6 +4,7 @@
 // - 完整缓存的条目下次刷到/重开 App 直接播本地
 import Foundation
 import UIKit
+import AVFoundation
 
 /// 浏览会话保存在 Application Support，不随视频缓存清理或系统回收而丢失。
 struct DYFeedSession: Codable {
@@ -22,9 +23,31 @@ struct DYFeedSession: Codable {
               session.items.contains(where: { $0.id == session.currentID }) else { return nil }
         return session
     }
-    func save() {
-        guard items.contains(where: { $0.id == currentID }),
-              let data = try? JSONEncoder().encode(self) else { return }
+    private static let queue = DispatchQueue(label: "douduo.feed-session", qos: .utility)
+    private static let lock = NSLock()
+    private static var pending: DYFeedSession?
+
+    /// 整份列表的编码 + 原子写盘不能压在主线程上（每滑一条会触发好几次，正好卡在翻页动画里）。
+    /// 默认交给后台串行队列，连续多次只写最后一份；切后台前用 `sync: true` 立即落盘。
+    func save(sync: Bool = false) {
+        guard items.contains(where: { $0.id == currentID }) else { return }
+        if sync {
+            Self.lock.lock(); Self.pending = nil; Self.lock.unlock()
+            Self.queue.sync { write() }
+            return
+        }
+        Self.lock.lock()
+        let scheduled = Self.pending != nil
+        Self.pending = self
+        Self.lock.unlock()
+        guard !scheduled else { return }
+        Self.queue.async {
+            Self.lock.lock(); let latest = Self.pending; Self.pending = nil; Self.lock.unlock()
+            latest?.write()
+        }
+    }
+    private func write() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
         do { try data.write(to: Self.url, options: .atomic) }
         catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
     }
@@ -144,6 +167,7 @@ actor DYVideoCache {
         for a in follow { pending[a.id] = a }
         job = Task { [weak self] in
             guard let self else { return }
+            await self.sweepSilent()
             await self.store(id: target.id)
             for a in follow {
                 if Task.isCancelled { return }
@@ -229,6 +253,14 @@ actor DYVideoCache {
                 try FileManager.default.moveItem(at: tmp, to: dst)
                 let bytes = ((try? FileManager.default.attributesOfItem(atPath: dst.path)[.size]) as? Int) ?? 0
                 guard bytes > 50_000 else { try? FileManager.default.removeItem(at: dst); continue }
+                // 有些条目的下载地址给的是「只有画面」的分轨流（声音另一路）。这种文件缓存下来，
+                // 刷到时走本地播放就是有画面没声音，要等它被淘汰、回到在线流才有声。
+                // 没有音轨的文件不留，换下一个地址；都没有就不缓存，直接走在线流。
+                guard await Self.hasAudio(dst) else {
+                    try? FileManager.default.removeItem(at: dst)
+                    DYLiveModel.log("DDCACHE drop no-audio \(a.id) \(bytes / 1024)KB host=\(u.host ?? "-")")
+                    continue
+                }
                 entries.removeAll { $0.aweme.id == a.id }
                 entries.append(Entry(aweme: a, watched: false, added: Date().timeIntervalSince1970, bytes: bytes))
                 evict()
@@ -240,6 +272,26 @@ actor DYVideoCache {
             }
         }
         if !Task.isCancelled { failed.insert(a.id) }
+    }
+
+    nonisolated static func hasAudio(_ file: URL) async -> Bool {
+        let tracks = try? await AVURLAsset(url: file).loadTracks(withMediaType: .audio)
+        return !(tracks ?? []).isEmpty
+    }
+
+    /// 清掉修复前留下的无声缓存文件（每次启动查一遍，最多几条）
+    private var sweptSilent = false
+    private func sweepSilent() async {
+        guard !sweptSilent else { return }
+        sweptSilent = true
+        for e in entries {
+            let f = Self.fileURL(e.aweme.id)
+            guard FileManager.default.fileExists(atPath: f.path), !(await Self.hasAudio(f)) else { continue }
+            try? FileManager.default.removeItem(at: f)
+            entries.removeAll { $0.aweme.id == e.aweme.id }
+            DYLiveModel.log("DDCACHE sweep no-audio \(e.aweme.id)")
+        }
+        save()
     }
 
     func markWatched(_ id: String) {

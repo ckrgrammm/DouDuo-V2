@@ -21,6 +21,9 @@ struct DYNativeForwardPanel: View {
     let loading: Bool
     let status: String
     let actions: [DYForwardPanelAction]
+    /// 已勾选的联系人；点头像切换勾选，由「发送给 N 人」统一确认。
+    var selected: Set<String> = []
+    var onSend: () -> Void = {}
     let onContact: (DYForwardContact) -> Void
     let onAction: (String) -> Void
     let onClose: () -> Void
@@ -39,6 +42,18 @@ struct DYNativeForwardPanel: View {
                     .padding(.horizontal, inset)
             } else {
                 contactRow
+                if !selected.isEmpty {
+                    Button(action: onSend) {
+                        Text("发送给 \(selected.count) 人")
+                            .font(.body.weight(.semibold))
+                            .frame(maxWidth: .infinity, minHeight: 28)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(loading)
+                    .padding(.horizontal, inset)
+                    .padding(.top, WuWeiDesign.Spacing.md)
+                    .accessibilityIdentifier("douyin.forward.send")
+                }
                 if loading || !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     contactStatus
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -106,6 +121,14 @@ struct DYNativeForwardPanel: View {
                             }
                             .frame(width: avatarSize, height: avatarSize)
                             .clipShape(Circle())
+                            .overlay(alignment: .bottomTrailing) {
+                                if selected.contains(contact.id) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(.white, Color.accentColor)
+                                        .background(Color(uiColor: .secondarySystemBackground), in: Circle())
+                                }
+                            }
                             .accessibilityHidden(true)
 
                             Text(contact.name)
@@ -119,7 +142,8 @@ struct DYNativeForwardPanel: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(contact.name)
-                    .accessibilityHint(contact.kind == 2 ? "选择群聊，确认后发送" : "选择联系人，确认后发送")
+                    .accessibilityHint(contact.kind == 2 ? "选择群聊，可多选，确认后发送" : "选择联系人，可多选，确认后发送")
+                    .accessibilityAddTraits(selected.contains(contact.id) ? .isSelected : [])
                     .accessibilityIdentifier("douyin.forward.contact.\(contact.id)")
                 }
             }

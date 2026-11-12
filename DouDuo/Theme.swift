@@ -89,11 +89,12 @@ extension View {
 extension View {
     /// 竖向液态玻璃胶囊（小红书式右侧栏底板）
     @ViewBuilder
-    func ddGlassCapsule() -> some View {
+    /// clear：更通透的玻璃（压在视频画面上用），能看清后面的内容
+    func ddGlassCapsule(clear: Bool = false) -> some View {
         if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: .capsule)
+            self.glassEffect(clear ? .clear.interactive() : .regular.interactive(), in: .capsule)
         } else {
-            self.background(.ultraThinMaterial, in: Capsule())
+            self.background(.ultraThinMaterial.opacity(clear ? 0.45 : 1), in: Capsule())
         }
     }
 }
