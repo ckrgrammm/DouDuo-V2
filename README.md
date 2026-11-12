@@ -1,40 +1,58 @@
 # DouDuo
 
-适配 iPhone Duo 折叠屏、iPad 和横屏的非官方抖音 iOS 客户端，使用 SwiftUI、AVPlayer 和 VLC。
+DouDuo is an unofficial Douyin client for iPhone, including foldable displays, and iPad. It uses SwiftUI for the interface and AVPlayer for video playback, with VLC support.
 
-## 当前功能
+## Features
 
-- **推荐、关注与直播**：上下滑切换内容。推荐流拖动时继续播放当前条，松手并完成分页后才切换播放。
-- **经典 / 沉浸布局**：在推荐页的「更多 → 设置 → 界面布局」切换。沉浸布局将互动按钮放到独立右侧栏，作者和文案叠在画面底部。支持折叠屏内外屏、横竖屏及侧边评论。[布局说明](docs/feed-layout-ab.md)
-- **播放与手势**：单击暂停、双击点赞、横滑快进快退、长按倍速。支持倍速锁定、可选后台音频和锁屏控件。
-- **互动与内容**：搜索、作者主页、点赞、收藏、评论及回复、弹幕、好友分享与消息、观看历史和稍后再看。直播支持关注主播入口和聊天室。账号相关互动需要登录。
+- **Recommendations, Following, and Live.** Swipe vertically to browse. In Recommendations, the current video keeps playing while you drag. Playback switches after you release and paging settles.
+- **Classic and Immersive layouts.** Switch from **More → Settings → Interface Layout** in Recommendations. Immersive puts actions in a separate right column and overlays the author and caption on the media. The app adapts to portrait, landscape, and inner and outer displays, with side-by-side comments where supported. [Layout details](docs/feed-layout-ab.md)
+- **Playback controls.** Tap to pause, double-tap to like, swipe horizontally to seek, or hold for faster playback. Playback speed lock, optional background audio, and lock-screen controls are available.
+- **Discovery and interaction.** Search, author profiles, likes, collections, threaded comments, on-screen comments, sharing with friends, messages, watch history, and Watch Later. Live includes a followed-host strip and chat. Account actions require sign-in.
 
-## 推荐流 Workers
+## Recommendation feed architecture
 
-推荐流默认允许 **2 个推荐 API 请求同时在途**。Worker 数表示请求并发上限。协调器统一分配请求序号，按响应到达顺序把候选合并到共享池，并按视频 ID 去重。
+```mermaid
+flowchart TD
+    UI["Recommendation pager"] -->|"Active page or refresh"| Model["Feed model"]
+    Model -->|"Request more candidates"| Coordinator["Feed coordinator"]
+    Coordinator -->|"Up to 2 concurrent requests"| API["Douyin recommendation API"]
+    API -->|"Responses as they arrive"| Coordinator
+    Coordinator -->|"Deduplicate by video ID"| Pool["Shared candidate pool"]
+    Pool -->|"Supply the forward buffer"| Model
+    Model -->|"Update the playback queue"| UI
+    UI -->|"Settled page"| Playback["Playback and prewarming"]
+    Playback -->|"Read and write media"| Cache["Disk video cache"]
+    Model -->|"Save and restore queue and progress"| Session["Feed session storage"]
+```
 
-| 调度项 | 当前配置 |
+### Workers and scheduling
+
+A worker represents one in-flight recommendation request. The coordinator assigns request sequence numbers and merges responses in arrival order.
+
+| Setting | Current behavior |
 | --- | --- |
-| 补货水位 | 播放列表中当前条之后的内容加候选池合计少于 8 条时开始补货，目标 20 条 |
-| 候选池 | 最多 80 条视频元数据 |
-| 播放列表前向缓冲 | 保持当前条之后约 6 条元数据 |
-| 请求限制 | 每轮最多 8 个，每分钟最多 24 个。连续 3 页没有新内容时，后台补货暂停 20 秒 |
-| 异常处理 | 请求超时释放并发名额，宽限期内可接收晚到结果。连续失败按轮指数退避 |
+| Default concurrency | 2 in-flight requests |
+| Refill threshold | Refill below 8 upcoming items across the queue and candidate pool, targeting 20 |
+| Candidate pool | Up to 80 video metadata records |
+| Forward buffer | About 6 items after the current video |
+| Request limits | Up to 8 per refill round and 24 per minute |
+| Empty pages and failures | Pause background refill for 20 seconds after 3 pages add nothing new. Apply exponential backoff on failed rounds. |
+| Timeouts | Free the request slot and accept late responses during the grace period |
 
-DEBUG 构建可用 `DOUDUO_FEED_WORKERS=1|2|4` 对比并发档位，或用 `DOUDUO_FEED_SERIAL=1` 强制串行。默认值、压测命令与样本数据见[推荐流供应管线](docs/feed-pipeline.md)。
+Debug builds support `DOUDUO_FEED_WORKERS` values of `1`, `2`, and `4`. Set `DOUDUO_FEED_SERIAL=1` to force serial requests. [Pipeline details and benchmarks](docs/feed-pipeline.md)
 
-## 播放预热与缓存
+### Prewarming and caching
 
-- **候选池**保存元数据。进入播放窗口后，预热器通常为后面 3 条准备 AVPlayer，设备热状态较高时缩到 2 或 1 条。
-- **磁盘缓存**围绕当前播放位置工作，缓存开启时优先处理当前条和后面 2 条。回滑优先复用已有本地缓存。
-- **会话恢复**保存推荐列表和播放进度，重新打开时可以恢复上次的播放位置。
+- The candidate pool stores metadata. The preloader prepares AVPlayer for the next 3 items, dropping to 2 or 1 as the device heats up.
+- With disk caching enabled, the cache prioritizes the current video and the next 2. Swiping back reuses cached media when available.
+- Feed sessions save the recommendation queue and playback progress for restoration on launch.
 
-## 本地开发
+## Local development
 
-使用带所需 Duo API 的 Xcode SDK 构建 `DouDuo.xcodeproj`。如需 VLC 本地依赖，运行 `./scripts/fetch-vlckit.sh`。推荐流调度可独立测试，无需模拟器或网络。
+Open `DouDuo.xcodeproj` in Xcode with an SDK that supports the Duo APIs used by the project. Run `./scripts/fetch-vlckit.sh` if you need the local VLC dependency. The feed pipeline tests run without a simulator or network access.
 
 ```sh
 ./scripts/test_feed_pipeline.sh
 ```
 
-[界面截图](docs/screenshots/README.md) · [隐私说明](PRIVACY.md) · [MIT 许可证](LICENSE)
+[Screenshots](docs/screenshots/README.md) · [Privacy](PRIVACY.md) · [MIT License](LICENSE)
