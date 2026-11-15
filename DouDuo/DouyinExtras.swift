@@ -1055,9 +1055,10 @@ struct DYListPlayer: View {
                         }
                     }
                     .scrollTargetLayout()
+                    .background(DYPagingSpeedBridge(ids: items.map(\.id), currentID: $currentID))
                 }
                 .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $currentID, anchor: .top)
+                .modifier(DYSettledPaging(currentID: $currentID))
                 .defaultScrollAnchor(.top)
                 .scrollIndicators(.hidden)
                 .frame(width: viewport.width, height: viewport.height)
@@ -2189,9 +2190,10 @@ struct DYFollowFeed: View {
                         }
                     }
                     .scrollTargetLayout()
+                    .background(DYPagingSpeedBridge(ids: m.items.map(\.id), currentID: $currentID))
                 }
                 .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $currentID, anchor: .top)
+                .modifier(DYSettledPaging(currentID: $currentID))
                 .scrollIndicators(.hidden)
             }
             }

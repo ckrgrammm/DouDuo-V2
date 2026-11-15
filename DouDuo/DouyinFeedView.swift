@@ -1415,19 +1415,32 @@ final class DYPreloader {
             // 图文：每张图都提前下好并在后台按屏幕尺寸解码（翻页时主线程不再解大图），背景音乐跟视频一样提前缓冲
             // 还没刷到的图文只备前 3 张：整条解码会把正在看的那条的图挤出内存缓存
             if !a.images.isEmpty { DYImagePostView.prefetchImages(a, limit: 3) }
+            // 图文没有视频要解码，直接算「可播」，否则分页器会一直把它拦下（图文页根本划不过去）
+            if !a.images.isEmpty { DYReadiness.mark(a.id) }
             let source: URL
+            var remote: URL?
             if let music = a.imageMusicURL { source = music }
-            else if a.images.isEmpty, let s = a.play, let url = URL(string: s) { source = DYVideoCache.localURL(a.id) ?? url }
+            else if a.images.isEmpty, let s = a.play, let url = URL(string: s) { source = DYVideoCache.localURL(a.id) ?? url; remote = url }
             else { continue }
             let item = AVPlayerItem(asset: DYMedia.asset(source))
-            item.preferredForwardBufferDuration = 6
+            // 紧挨着的下一条要「已经加载好」：不限制前向缓冲（0 = 交给系统）；再后面的留 6 秒够起播，省流量
+            item.preferredForwardBufferDuration = a.id == window.first?.id ? 0 : 6
             let p = AVPlayer(playerItem: item)
             p.isMuted = true
             p.automaticallyWaitsToMinimizeStalling = true
             players[a.id] = p
-            // ready 后 preroll：把开头的数据和首帧解码好
-            obs[a.id] = item.observe(\.status, options: [.new]) { [weak p] it, _ in
+            // 数据一到就登记「可播」（分页器据此放行下一条），再 preroll 把开头数据和首帧解码好
+            obs[a.id] = item.observe(\.status, options: [.new]) { [weak self, weak p] it, _ in
+                if it.status == .failed, let remote {
+                    // 预热失败：别把坏播放器交给页面（页面会拿着它等超时），换在线地址重试一次
+                    let e = it.error as NSError?
+                    let wasLocal = (it.asset as? AVURLAsset)?.url.isFileURL ?? false
+                    DYLiveModel.log("DDPRELOADFAIL \(a.id.suffix(6)) local=\(wasLocal) err=\(e?.domain ?? "-")/\(e?.code ?? 0)")
+                    DispatchQueue.main.async { self?.retry(a.id, remote: remote) }
+                    return
+                }
                 guard it.status == .readyToPlay else { return }
+                if a.images.isEmpty { DYReadiness.mark(a.id) }
                 DispatchQueue.main.async { p?.preroll(atRate: 1) { _ in } }
             }
             if a.images.isEmpty, let c = a.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c); _ = await DYVideoBackdropCache.shared.load(c) } }
@@ -1441,7 +1454,10 @@ final class DYPreloader {
             handedOut.insert(id)
             return handoff.player
         }
-        guard let p = players.removeValue(forKey: id) else { return nil }
+        guard let p = players[id] else { return nil }
+        // 失败的预热播放器不交给页面（交出去页面就拿着一个坏播放器等超时）
+        if p.currentItem?.status == .failed { return nil }
+        players.removeValue(forKey: id)
         obs.removeValue(forKey: id)?.invalidate()
         handedOut.insert(id)
         p.isMuted = false
@@ -1455,7 +1471,35 @@ final class DYPreloader {
         handedOut.removeAll()
     }
 
+    /// 预热失败只重试一次：改用在线地址重建；还不行就放行给页面自己处理（别把人卡在弹回里）
+    private var retried: Set<String> = []
+    private func retry(_ id: String, remote: URL) {
+        guard let old = players[id], !retried.contains(id) else { DYReadiness.mark(id); return }
+        retried.insert(id)
+        if retried.count > 200 { retried.removeAll() }
+        release(id, old)
+        let item = AVPlayerItem(asset: DYMedia.asset(remote))
+        item.preferredForwardBufferDuration = 6
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true
+        p.automaticallyWaitsToMinimizeStalling = true
+        players[id] = p
+        obs[id] = item.observe(\.status, options: [.new]) { [weak p] it, _ in
+            if it.status == .failed {
+                DYLiveModel.log("DDPRELOADFAIL2 \(id.suffix(6)) err=\((it.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-")")
+                DYReadiness.mark(id)
+                return
+            }
+            guard it.status == .readyToPlay else { return }
+            DYReadiness.mark(id)
+            DispatchQueue.main.async { p?.preroll(atRate: 1) { _ in } }
+        }
+        DYLiveModel.log("DDPRELOADRETRY \(id.suffix(6)) → 在线")
+    }
+
     private func release(_ id: String, _ p: AVPlayer) {
+        // 播放器都被释放了，就别再说它「可播」（否则分页器会放行到一条其实没准备好的）
+        if !handedOut.contains(id) { DYReadiness.clear(id) }
         obs.removeValue(forKey: id)?.invalidate()
         p.pause()
         p.replaceCurrentItem(with: nil)
@@ -1779,6 +1823,8 @@ struct DouyinFeedScreen: View {
     @State private var userScrolling = false
     @State private var draggingRecommendation = false
     @State private var scrollEndTask: Task<Void, Never>?
+    /// 系统「减少动态效果」时分页收尾不接管，退回系统分页 + 停住即切
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
@@ -2603,7 +2649,9 @@ struct DouyinFeedScreen: View {
                             case .tracking, .interacting:
                                 userScrolling = true
                             case .idle:
-                                commitRecommendationScroll()
+                                // 分页收尾接管时：抬手那一刻就 idle 了（系统减速被清零），真正切当前条在收尾动画停住时
+                                // （DYPagingSpeedBridge.onSettle）。这里只留兜底，防止收尾没接上卡在上一条。
+                                if reduceMotion { commitRecommendationScroll() } else { scheduleSettleFallback() }
                             default:
                                 break
                             }
@@ -2780,6 +2828,12 @@ struct DouyinFeedScreen: View {
                 }
             }
             .scrollTargetLayout()
+            // 翻页收尾（上游 1.5.2）：拖过 1/4 屏或快甩才翻；下一条没就绪弹回；停稳才切当前条起播。
+            // 直播卡没有「首帧」可等（线路已提前暖），直接放行。
+            .background(DYPagingSpeedBridge(
+                ids: recommendationPageIDs, currentID: $currentID,
+                isReady: { $0.hasPrefix(recommendationLivePrefix) || DYReadiness.isReady($0) },
+                onSettle: { commitRecommendationScroll(to: $0) }))
             .onGeometryChange(for: CGFloat.self) {
                 $0.frame(in: .named("recommendationPager")).minY
             } action: { _ in
@@ -2821,13 +2875,36 @@ struct DouyinFeedScreen: View {
         }
     }
 
-    private func commitRecommendationScroll() {
+    /// 分页器里从上到下的页面 ID（视频 + 插在中间的直播卡），给分页收尾算目标页用
+    private var recommendationPageIDs: [String] {
+        feed.items.flatMap { item -> [String] in
+            guard let room = recommendationLiveRoom(after: item.id) else { return [item.id] }
+            return [item.id, recommendationLivePrefix + room.id]
+        }
+    }
+
+    /// 收尾接管时的兜底：抬手后 0.8 秒还没收到 onSettle（分页桥没接上），按实际位置切当前条，别卡在上一条
+    private func scheduleSettleFallback() {
+        guard userScrolling else { return }
+        scrollEndTask?.cancel()
+        scrollEndTask = Task {
+            try? await Task.sleep(for: .milliseconds(800))
+            guard !Task.isCancelled, userScrolling else { return }
+            DYLiveModel.log("DDSETTLE-FALLBACK \(scrollID?.suffix(6) ?? "-")")
+            commitRecommendationScroll()
+        }
+    }
+
+    /// target：分页收尾停住的那一页；不传就按 scrollPosition 的当前位置
+    private func commitRecommendationScroll(to target: String? = nil) {
         guard userScrolling else { return }
         cancelRecommendationScroll()
-        guard let id = scrollID, isRecommendationPage(id) else {
+        guard let id = target ?? scrollID, isRecommendationPage(id) else {
             scrollID = currentID
             return
         }
+        // SwiftUI 在没有系统减速时可能不写最后一次 scrollPosition：以停住的页为准
+        if scrollID != id { scrollID = id }
         if id != currentID {
             let leavingLive = currentID?.hasPrefix(recommendationLivePrefix) == true
             if leavingLive {

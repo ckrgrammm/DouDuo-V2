@@ -416,6 +416,7 @@ struct PlayerPage: View {
     @AppStorage("douyin_rate_v1") private var lockedRate = 1.0
     @State private var dmClock = DYDanmakuClock()
     @State private var timeToken: Any?
+    @State private var primeObs: NSKeyValueObservation?
     @State private var endObserver: NSObjectProtocol?
     /// 播放项直接失败（地址 403 / 解不开）就立刻换备用地址，不等 6 秒看门狗
     @State private var failObserver: NSKeyValueObservation?
@@ -444,7 +445,7 @@ struct PlayerPage: View {
                     // 画面层真正有帧可显示（isReadyForDisplay）就撤掉封面：预加载 / 本地缓存的视频滑过来就是真画面，
                     // 不再「先闪一下封面再播」
                     ZStack {
-                        VideoSurface(player: player, fillWidth: fillWidth, onReady: { if !firstFrame { firstFrame = true } })
+                        VideoSurface(player: player, fillWidth: fillWidth, onReady: { if !firstFrame { firstFrame = true }; DYReadiness.mark(id) })
                             
                         // 头部缓存接在线流：新播放器先叠在上面亮相（已缓冲、时间点对齐），再撤掉旧的，
                         // 避免换 AVPlayerLayer 的 player 时断帧
@@ -463,20 +464,8 @@ struct PlayerPage: View {
                     VideoSurface(player: hd, fillWidth: fillWidth)
                         .opacity(hdVisible ? 1 : 0.001).allowsHitTesting(false)
                 }
-                // 封面只给「还没缓存、还没出帧」的在线视频兜底；本地已缓存的直接等首帧（几十毫秒），不铺封面
-                if !firstFrame, let posterURL {
-                    GeometryReader { g in
-                        let screen = g.size.width / max(g.size.height, 1)
-                        let video = videoAspect > 0 ? videoAspect : screen
-                        let same = (video < 1) == (screen < 1)
-                        CachedAsyncImage(url: posterURL) { img in
-                            img.resizable().aspectRatio(contentMode: fillWidth && same ? .fill : .fit)
-                        } placeholder: { Color.clear }
-                        .frame(width: g.size.width, height: g.size.height)
-                    }
-                        
-                        .allowsHitTesting(false)
-                }
+                // 不再铺封面临时顶替首帧（上游 1.5.2）：封面比例常常和真画面不一致，起播时会「跳一下」。
+                // 下一条已在预热池里解好首帧，滑过来就是真画面。
             }
             .modifier(DYMediaViewport(aspect: videoAspect, fillPortrait: fillWidth, maxCrop: fillCropLimit))
             if isActive && (!danmaku.isEmpty || dmStress) {
@@ -562,7 +551,14 @@ struct PlayerPage: View {
                 #if DEBUG
                 logSwipeStart(p)
                 #endif
-                p.isMuted = muted; p.play(); isPlaying = true
+                p.isMuted = muted
+                // 已缓冲够就跳过 AVPlayer「评估缓冲速率」的等待，直接按目标速率走（上游 1.5.2「点到就播」）
+                if p.currentItem?.status == .readyToPlay, Self.bufferedAhead(p) >= 1.5 {
+                    p.playImmediately(atRate: Float(lockedRate))
+                } else {
+                    p.play()
+                }
+                isPlaying = true
                 watchdog(p)
             } else {
                 p.isMuted = true; p.pause(); isPlaying = false
@@ -818,7 +814,7 @@ struct PlayerPage: View {
             p.play()
         }
         isPlaying = isActive
-        if isActive { watchdog(p) }
+        if isActive { watchdog(p) } else { primeFirstFrame(p) }
         #if DEBUG
         if isActive {
             let t0 = Date()
@@ -1031,6 +1027,34 @@ struct PlayerPage: View {
             guard stuck else { return }
             logStartDiag(p)
             recover()
+        }
+    }
+
+    /// 当前播放点之后已缓冲的秒数
+    static func bufferedAhead(_ p: AVPlayer) -> Double {
+        guard let it = p.currentItem else { return 0 }
+        let now = p.currentTime().seconds
+        for v in it.loadedTimeRanges {
+            let r = v.timeRangeValue
+            let s = r.start.seconds, e = (r.start + r.duration).seconds
+            if now >= s - 0.1, now <= e { return e - now }
+        }
+        return 0
+    }
+
+    /// 提前挂上的相邻页（上游 1.5.2）：暂停的 AVPlayer 不会自己解第一帧，画面层一直是黑的，
+    /// 滑进来才开始解 →「黑一下再播」。数据一到就登记可播，并 preroll 把首帧和开头缓冲准备好。
+    private func primeFirstFrame(_ p: AVPlayer) {
+        guard let it = p.currentItem else { return }
+        func prime() {
+            guard player === p, !isActive, p.rate == 0, p.status == .readyToPlay else { return }
+            p.preroll(atRate: 1) { _ in }
+        }
+        if it.status == .readyToPlay { DYReadiness.mark(id); prime(); return }
+        primeObs?.invalidate()
+        primeObs = it.observe(\.status, options: [.new]) { item, _ in
+            guard item.status == .readyToPlay else { return }
+            DispatchQueue.main.async { primeObs?.invalidate(); primeObs = nil; DYReadiness.mark(id); prime() }
         }
     }
 
@@ -1294,6 +1318,7 @@ struct PlayerPage: View {
 
     private func teardown() {
         if isActive { DYVideoCache.shared.reportPlaybackWaiting(false) }
+        primeObs?.invalidate(); primeObs = nil
         cancelUpgrade()
         if let v = vlc { onSavePosition(v.current); v.onEnd = nil; v.onProgress = nil; v.stop(); vlc = nil }
         if let p = player { onSavePosition(p.currentTime().seconds) }
