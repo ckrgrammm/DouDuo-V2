@@ -1825,6 +1825,9 @@ struct DouyinFeedScreen: View {
     @State private var scrollEndTask: Task<Void, Never>?
     /// 系统「减少动态效果」时分页收尾不接管，退回系统分页 + 停住即切
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// 应用内私信提醒（上游 1.5.2，默认关）；打开后刷视频时也在后台预热私信
+    @AppStorage(DYDMNotificationSettings.notifyKey) private var dmNotifications = false
+    @AppStorage(DYDMNotificationSettings.detailKey) private var dmDetail = false
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
@@ -2182,12 +2185,13 @@ struct DouyinFeedScreen: View {
             await live.prepareFeaturedEntry(bridge)
         }
         .onChange(of: showMessages || swipeReveal == .messages) { _, open in
-            // 消息页（含侧滑露出一半又取消）一离开就释放聊天网页，不在后台挂着
-            if !open {
-                DYMessageCache.shared.releaseChat()
-                Task { await refreshNoticeUnread() }
-            }
+            // 上游 1.5.2：聊天网页不再离开就释放——打开了应用内私信提醒时，刷视频期间它挂在后台
+            // 读好会话列表（DYChatWebSession / DYChatPrewarm），点进消息页直接显示、点会话立刻进入。
+            if DYDMProbe.enabled { DYChatWebSession.shared.setMessagesVisible(open) }
+            if !open { Task { await refreshNoticeUnread() } }
         }
+        // 刷视频时收到私信：应用内弹出提醒（设置 → 消息 里开关，默认关）
+        .modifier(DYDMBannerModifier(messagesVisible: showMessages, openMessages: { setMessages(true) }))
         .task {
             // 启动查一次新版本；关掉后同一版本不再提示
             if let u = await DDUpdateChecker.check() { pendingUpdate = u }
@@ -3125,6 +3129,13 @@ struct DouyinFeedScreen: View {
                         }
                     }
                 } label: { Label("缓存管理", systemImage: "internaldrive") }
+                Menu {
+                    Toggle(isOn: $dmNotifications) { Label("应用内私信提醒", systemImage: "bell.badge") }
+                        .accessibilityIdentifier("settings.dm.notify")
+                    Toggle(isOn: $dmDetail) { Label("提醒里显示会话名称与头像", systemImage: "person.crop.circle.badge") }
+                        .disabled(!dmNotifications)
+                        .accessibilityIdentifier("settings.dm.detail")
+                } label: { Label("消息", systemImage: "bubble.left.and.bubble.right") }
                 Menu {
                     Button("官网 / 登录（备用入口）", systemImage: "safari") { web = DYWebTarget(url: DouyinWeb.home) }
                 } label: { Label("账号与登录", systemImage: "person.crop.circle") }

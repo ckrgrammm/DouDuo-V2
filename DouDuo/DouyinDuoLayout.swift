@@ -502,6 +502,18 @@ struct DYCommentDock<Video: View, Panel: View>: View {
 }
 
 enum DYDuoMetrics {
+    /// 半折叠时按真实折痕切出的两个窗格（上游消息页双栏用）；没在半折叠就是 nil
+    static func hingeSplit(_ geo: GeometryProxy) -> (video: CGRect, panel: CGRect, book: Bool)? {
+        guard DYDuoMetrics.foldIsActive(geo) else { return nil }
+        guard #available(iOS 27.1, *) else { return nil }
+        let divisions = geo.reservedRegions(kind: .division).map {
+            DYLiveDivision(frame: $0.frame, isActive: $0.isActive)
+        }
+        guard let p = DYLiveAdaptiveLayoutEngine.hingePanes(
+            bounds: CGRect(origin: .zero, size: geo.size), divisions: divisions) else { return nil }
+        return (p.first, p.second, p.book)
+    }
+
     /// iOS 17–27.0 的宽屏回退，和改版前同一条线。
     static let legacyWideMin: CGFloat = 700
 

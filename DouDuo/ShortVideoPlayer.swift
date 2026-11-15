@@ -508,6 +508,12 @@ struct PlayerPage: View {
             pauseForBackground()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            // 被信息页 / 设置等盖住时不许自己起播（上游 1.5.2）：每个播放器直接监听回前台会绕过 DDPlayback 的遮罩计数，
+            // 停在信息页切出去再回来，外面的视频照样出声。遮罩期间交给 DDPlayback.releaseCover() 统一恢复。
+            guard !DDPlayback.shared.coverHold else {
+                DYLiveModel.log("DDRESUME skip id=\(id.suffix(6)) cover")
+                return
+            }
             resumeAfterBackground()
         }
         .onReceive(NotificationCenter.default.publisher(for: DDPlayback.reclaimAudioNotification)) { note in

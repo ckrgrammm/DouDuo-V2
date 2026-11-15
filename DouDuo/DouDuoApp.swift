@@ -85,7 +85,12 @@ struct DouDuoApp: App {
     @UIApplicationDelegateAdaptor(DouDuoAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
-    init() { DDPerf.mark("app.init") }
+    init() {
+        DDPerf.mark("app.init")
+        // 信息里的图片 / 封面都走网页：默认 URLCache 又小又以内存为主，进聊天每次都重下（上游 1.5.2）。
+        // 放大到 512MB 磁盘（跨启动复用）。
+        URLCache.shared = URLCache(memoryCapacity: 64 << 20, diskCapacity: 512 << 20, diskPath: "dd-url-cache")
+    }
 
     var body: some Scene {
         WindowGroup {

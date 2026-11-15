@@ -150,6 +150,7 @@ struct DouyinWebScreen: View {
 
 @MainActor
 final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
+    @Published var windowSize: CGSize = .zero
     @Published var canGoBack = false
     @Published var progress: Double = 0
     weak var web: WKWebView?
@@ -198,7 +199,15 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
 
     /// 打开时像 App 一样直接进「推荐」竖屏流（首次访问会被导到精选）
     private var jumpedToFeed = false
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard DYDMProbe.enabled, webView === DYMessageCache.shared.chatModel.web else { return }
+        DYChatWebSession.shared.noteProvisionalNavigation()
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if DYDMProbe.enabled, webView === DYMessageCache.shared.chatModel.web {
+            DYChatWebSession.shared.noteDidFinish()
+        }
         #if DEBUG
         // 模拟器调试：DOUDUO_OPEN=login 时自动点「登录」弹出扫码框
         if ProcessInfo.processInfo.environment["DOUDUO_OPEN"] == "login", !clickedLogin {
@@ -290,7 +299,9 @@ final class DDAppMessageHandler: NSObject, WKScriptMessageHandler {
     private let model: DouyinWebModel
     init(_ model: DouyinWebModel) { self.model = model }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        if let s = message.body as? String { model.onAppMessage?(s) }
+        guard let body = message.body as? String else { return }
+        if DYDMProbe.enabled, DYDMProbeBridge.consume(body, message: message) { return }
+        model.onAppMessage?(body)
     }
 }
 
@@ -301,14 +312,47 @@ private let ddVideoTapHookJS = #"""
 (() => {
   if (window.__ddVideoTapHook) return; window.__ddVideoTapHook = 1;
   const post = (o) => { try { window.webkit.messageHandlers.ddMsg.postMessage(JSON.stringify(o)); } catch (e) {} };
+    const payloadOf = root => {
+      const seen2 = new Set();
+      for (let n = root, d = 0; n && d < 12; n = n.parentElement, d++) {
+        for (const k of Object.keys(n)) {
+          if (k.startsWith('__reactProps')) {
+            const m = n[k]?.message;
+            if (m) { try { return m.parsedContent || JSON.parse(m.content || 'null'); } catch (_) { return null; } }
+          }
+          if (!k.startsWith('__reactFiber') && !k.startsWith('__reactInternalInstance')) continue;
+          for (let f = n[k], depth = 0; f && depth < 24 && !seen2.has(f); f = f.return, depth++) {
+            seen2.add(f);
+            const m = f.memoizedProps?.message;
+            if (m) { try { return m.parsedContent || JSON.parse(m.content || 'null'); } catch (_) { return null; } }
+          }
+        }
+        if (n.matches?.('[data-e2e="message-item"]')) break;
+      }
+      return null;
+    };
   const findID = (root) => {
     // Verified IM ShareAweme payload: message.parsedContent (aweType=800).
     // Never infer an aweme ID from a user/message ID or an arbitrary DOM attribute.
     const fromMessage = message => {
       try {
         const payload = message.parsedContent || JSON.parse(message.content || 'null');
-        const id = payload?.itemId;
-        return Number(payload?.aweType) === 800 && typeof id === 'string' && /^\d{15,25}$/.test(id) ? id : null;
+        // 三种分享卡的 ID 字段不一样（真机抓包）：
+        //   aweType 800（视频）/ 0（图文）：itemId
+        //   aweType 11054（群里的视频卡 BulletBulletVideo）：item_id 或 aweme_info.aweme_id
+        const pick = v => (typeof v === 'number' && Number.isSafeInteger(v)) ? null : (typeof v === 'string' ? v : null);
+        const id = pick(payload?.itemId) || pick(payload?.item_id)
+          || pick(payload?.aweme_info?.aweme_id) || pick(payload?.aweme_info?.item_id);
+        if (typeof id !== 'string' || !/^\d{15,25}$/.test(id)) return null;
+        if (Number(payload?.aweType) === 11054 && (payload?.item_id || payload?.aweme_info)) return id;
+        // 800 = 分享视频；图文（笔记）分享的 aweType 是 0，payload 里带 image_count / is_slides /
+        // awemeType=68。只认「确实是作品卡」的 payload，避免把普通消息里的 id 当作品 id。
+        const awe = Number(payload?.aweType);
+        const isWork = awe === 800
+          || Number(payload?.image_count) > 0
+          || payload?.is_slides === true
+          || Number(payload?.awemeType) === 68;
+        return isWork ? id : null;
       } catch (_) { return null; }
     };
     const seen = new Set();
@@ -330,6 +374,20 @@ private let ddVideoTapHookJS = #"""
     }
     return null;
   };
+    // 图文分享（抖音的「笔记」）：卡片里带 /note/<作品id> 或 /video/<作品id> 的链接/属性
+    const idFromCard = card => {
+      const attr = (el, names) => { for (const n of names) { const v = el.getAttribute?.(n); if (v && /^\d{15,25}$/.test(v)) return v; } return null; };
+      const anchors = card.querySelectorAll ? [...card.querySelectorAll('[href],[data-aweme-id],[data-item-id],[data-id]')] : [];
+      for (const a of anchors) {
+        const href = a.getAttribute('href') || '';
+        const m = /\/(?:note|video|share\/(?:note|video))\/(\d{15,25})/.exec(href);
+        if (m) return m[1];
+        const direct = attr(a, ['data-aweme-id', 'data-item-id', 'data-id']);
+        if (direct) return direct;
+      }
+      const self = attr(card, ['data-aweme-id', 'data-item-id', 'data-id']);
+      return self || null;
+    };
   document.addEventListener('click', (ev) => {
     try {
       if (!/\/chat/.test(location.pathname)) return;
@@ -337,23 +395,53 @@ private let ddVideoTapHookJS = #"""
       const pane = t.closest('[class*="componentsRightPanel"],[class*="rightPanel"]');
       if (!pane) return;
       // 实测类名：分享视频卡 = MessageItemShareAweme* / BulletBulletVideo*
-      const media = t.closest('[class*="ShareAweme"],[class*="BulletBulletVideo"],[class*="videoCard"],[class*="VideoCard"]');
-      if (!media) return;
+      let media = t.closest('[class*="ShareAweme"],[class*="BulletBulletVideo"],[class*="videoCard"],[class*="VideoCard"],[class*="ShareImage"],[class*="BulletBulletImage"],[class*="imageCard"],[class*="ImageCard"]');
+      // 类名没覆盖到的分享卡：只要点在一条消息里，也照样试着从消息 payload 取作品 ID（取不到就交回网页）
+      if (!media) {
+        media = t.closest('[data-e2e="message-item"], [class*="MessageItem"]');
+        if (!media) return;
+      }
       // 严格向上找第一个「消息项」祖先（closest 会命中自身，不能用）
       let card = null;
       for (let n = media.parentElement; n && n !== pane; n = n.parentElement) {
         if (String(n.className || '').includes('MessageItem')) { card = n; break; }
       }
       if (!card) card = media;
-      const id = findID(card);
+      const id = findID(card) || idFromCard(card);
       if (id) {
         ev.preventDefault(); ev.stopPropagation();
         console.log('DDVIDEOTAP jump ' + id);
         post({type: 'video', id: id});
         return;
       }
-      // Leave unsupported cards to the official web UI; don't guess an ID.
-      post({type: 'video-miss', html: 'shared-video-payload-unavailable'});
+      // 取不到作品 ID：交回网页自己处理，同时把卡片线索回传方便下次迭代
+      let diag = {};
+      try {
+        diag.classes = String(media.className || '') + ' | ' + String(card.className || '');
+        diag.images = card.querySelectorAll ? card.querySelectorAll('img').length : -1;
+        diag.hrefs = card.querySelectorAll
+          ? [...card.querySelectorAll('[href]')].slice(0, 3).map(e => String(e.getAttribute('href') || '').slice(0, 120))
+          : [];
+        const pl = payloadOf(card);
+        diag.aweType = pl && pl.aweType != null ? String(pl.aweType) : null;
+        diag.keys = pl ? Object.keys(pl).slice(0, 24).join(',') : null;
+        diag.itemId = pl && /^\d{15,25}$/.test(String(pl.itemId || '')) ? String(pl.itemId) : null;
+        diag.html = String(card.outerHTML || '').slice(0, 500);
+        const chain = [];
+        for (let n = card, d = 0; n && d < 6 && chain.length < 14; n = n.parentElement, d++) {
+          for (const k of Object.keys(n).filter(k => k.startsWith('__react')).slice(0, 2)) {
+            for (let f = n[k], i = 0; f && i < 6 && chain.length < 14; f = f.return, i++) {
+              const p = f.memoizedProps;
+              if (!p) continue;
+              const names = Object.keys(p).slice(0, 8).join('/');
+              if (names) chain.push(d + ':' + i + ':' + names);
+              if (p.message) chain.push('MSG@' + d + ':' + i + ':' + Object.keys(p.message).slice(0, 10).join('/'));
+            }
+          }
+        }
+        diag.chain = chain.join(' ; ').slice(0, 800);
+      } catch (e) { diag.err = String(e && e.message); }
+      post(Object.assign({type: 'video-miss', html: 'shared-video-payload-unavailable'}, diag));
     } catch (e) {}
   }, true);
 })();
@@ -367,8 +455,15 @@ struct DouyinWebContainer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         if reuseExisting, let existing = model.web { return existing }
+        return Self.instantiate(model: model, zoom: zoom, start: start)
+    }
+
+    static func instantiate(model: DouyinWebModel, zoom: Double, start: URL, includeProbe: Bool = false) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()            // 登录态持久化
+        #if DEBUG
+        if DYMessageFixture.enabled && start.path == "/chat" { cfg.websiteDataStore = .nonPersistent() }
+        #endif
         cfg.allowsInlineMediaPlayback = true
         cfg.mediaTypesRequiringUserActionForPlayback = []
         // 网页全屏按钮走网页自己的全屏（同电脑版），不弹系统播放器；系统播放器退出后网页还以为在全屏，再点就没反应
@@ -382,9 +477,19 @@ struct DouyinWebContainer: UIViewRepresentable {
         // 聊天页点分享视频 → 抽 aweme_id 发给 App（只在 /chat 页生效）
         cfg.userContentController.addUserScript(
             WKUserScript(source: ddVideoTapHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // 信息里的图片本地缓存：ddimg:// 由 App 供图，键只认路径（签名变化也能命中）
+        if start.path == "/chat" || start.path.hasPrefix("/chat") {
+            cfg.setURLSchemeHandler(DYChatImageSchemeHandler(), forURLScheme: DYChatImageCache.scheme)
+            cfg.userContentController.addUserScript(
+                WKUserScript(source: DYChatImageRewrite.script, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
         // 网页 → App 消息通道
         cfg.userContentController.add(DDAppMessageHandler(model), name: "ddMsg")
         DYLiveModel.log("DDMSG ddmsg-handler registered")
+        if includeProbe {
+            cfg.userContentController.addUserScript(
+                WKUserScript(source: DYDMProbeScript.install, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         // 电脑版直播间的播放器要 MediaSource，iPhone 的 WebView 只有 ManagedMediaSource（iOS 17.1+），
         // 没有它就一直「直播加载中」。这里把它补成 MediaSource；ManagedMediaSource 要求关掉隔空播放才能挂到 <video> 上
         cfg.userContentController.addUserScript(WKUserScript(source: """
@@ -401,17 +506,30 @@ struct DouyinWebContainer: UIViewRepresentable {
         })();
         """, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let wv = DouyinFitWebView(frame: .zero, configuration: cfg)
+        wv.onWindowSizeChange = { [weak model] size in model?.windowSize = size }
         wv.customUserAgent = DouyinWeb.userAgent
         wv.navigationDelegate = model
         wv.uiDelegate = model
         wv.allowsBackForwardNavigationGestures = true
         wv.isOpaque = false
+        wv.backgroundColor = .clear
+        wv.scrollView.backgroundColor = .clear
+        if start.path == "/chat" {
+            wv.underPageBackgroundColor = .clear
+            wv.scrollView.keyboardDismissMode = .interactive
+        }
         wv.scrollView.contentInsetAdjustmentBehavior = .never
         wv.userZoom = zoom
         #if DEBUG
         wv.isInspectable = true
         #endif
         model.attach(wv)
+        #if DEBUG
+        if DYMessageFixture.enabled && start.path == "/chat" {
+            wv.loadHTMLString(DYMessageFixture.page, baseURL: URL(string: "https://www.douyin.com/chat"))
+            return wv
+        }
+        #endif
         wv.load(URLRequest(url: start))
         return wv
     }
@@ -423,11 +541,17 @@ struct DouyinWebContainer: UIViewRepresentable {
 
 /// 把当前宽度和缩放档同步给页面脚本（开合 / 旋转 / 换档 / 每次页面提交都同步一次）
 final class DouyinFitWebView: WKWebView {
+    var onWindowSizeChange: ((CGSize) -> Void)?
+    private var lastWindowSize: CGSize = .zero
     var userZoom: Double = 1 { didSet { if oldValue != userZoom { syncViewport() } } }
     private var lastWidth: CGFloat = 0
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        if let size = window?.bounds.size, size != lastWindowSize {
+            lastWindowSize = size
+            DispatchQueue.main.async { [weak self] in self?.onWindowSizeChange?(size) }
+        }
         if abs(bounds.width - lastWidth) > 0.5 { lastWidth = bounds.width; syncViewport() }
     }
 

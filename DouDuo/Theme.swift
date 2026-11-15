@@ -47,6 +47,9 @@ struct DDTheme {
     let typography = Typography()
     /// Shared native/web IM canvas; CSS values stay in the theme, not business scripts.
     struct Messages {
+        let sidebarTint = Color(.sRGB, red: 22 / 255, green: 22 / 255, blue: 22 / 255, opacity: 1)
+        let pinnedRow = Color(.sRGB, red: 36 / 255, green: 36 / 255, blue: 36 / 255, opacity: 1)
+        let selectedRow = Color(.sRGB, red: 36 / 255, green: 36 / 255, blue: 36 / 255, opacity: 1)
         let headerHeight: CGFloat = 60
         let canvasCSS = "#000000"
         let separatorCSS = "rgba(255,255,255,0.10)"

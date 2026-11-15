@@ -28,6 +28,26 @@
 		844D4A4311515599F9DF42DE /* DouDuoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DEA756C4CD3920F4920BACF /* DouDuoApp.swift */; };
 		85C30C1C9411C32D14761E7A /* DouyinExtras.swift in Sources */ = {isa = PBXBuildFile; fileRef = D66F335DE5A601EA019AD61E /* DouyinExtras.swift */; };
 		A1F00D0FEED0C0DE00000001 /* DouyinFeedPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */; };
+		C334CA281E44DB627BB9552A /* DYForwardReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = C434CA281E44DB627BB9552A /* DYForwardReceipt.swift */; };
+		C316A89F409CBA12ED5E9E78 /* DYStreakBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C416A89F409CBA12ED5E9E78 /* DYStreakBadge.swift */; };
+		C335F210A62AFA3B4B2A4D62 /* DYMessageSidebarLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = C435F210A62AFA3B4B2A4D62 /* DYMessageSidebarLayout.swift */; };
+		C37C532E59EF9FC51BB928D1 /* DYMessageRowBoundsKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = C47C532E59EF9FC51BB928D1 /* DYMessageRowBoundsKey.swift */; };
+		C37E9C7CA6E9E8A226939369 /* DYMessageFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = C47E9C7CA6E9E8A226939369 /* DYMessageFixture.swift */; };
+		C323C018389B0A24682CD818 /* DYMessageDivider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C423C018389B0A24682CD818 /* DYMessageDivider.swift */; };
+		C32E09ADBC9517A150D6F9EC /* DYDMProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = C42E09ADBC9517A150D6F9EC /* DYDMProbe.swift */; };
+		C32C09859B8BC303ADE07658 /* DYDMBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C42C09859B8BC303ADE07658 /* DYDMBanner.swift */; };
+		C3F0FE69C21E713101981B85 /* DYConversationSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4F0FE69C21E713101981B85 /* DYConversationSync.swift */; };
+		C368A4AE96D3BDFADE52EEE1 /* DYConversationStreak.swift in Sources */ = {isa = PBXBuildFile; fileRef = C468A4AE96D3BDFADE52EEE1 /* DYConversationStreak.swift */; };
+		C365ED149D2E52A3CFD5AA2E /* DYConversationCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = C465ED149D2E52A3CFD5AA2E /* DYConversationCell.swift */; };
+		C33F52DB025141406E2497FE /* DYChatWebBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C43F52DB025141406E2497FE /* DYChatWebBridge.swift */; };
+		C37187F1B941CA3F73D96D08 /* DYChatTextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C47187F1B941CA3F73D96D08 /* DYChatTextEditor.swift */; };
+		C34BA9EEDBD9F6A817CDBCEC /* DYChatOptionsPopover.swift in Sources */ = {isa = PBXBuildFile; fileRef = C44BA9EEDBD9F6A817CDBCEC /* DYChatOptionsPopover.swift */; };
+		C3155256CBFAA165DFB81156 /* DYChatImageCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4155256CBFAA165DFB81156 /* DYChatImageCache.swift */; };
+		C3E34DE260D3A331669C700C /* DYChatHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4E34DE260D3A331669C700C /* DYChatHeader.swift */; };
+		C3E37A4111BFC1CA3C4E56FC /* DYChatComposerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4E37A4111BFC1CA3C4E56FC /* DYChatComposerModel.swift */; };
+		C3C3BC84A387674CD3FAB842 /* DYChatComposerBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4C3BC84A387674CD3FAB842 /* DYChatComposerBridge.swift */; };
+		C353859F2CD8B0570A2CB168 /* DYChatComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C453859F2CD8B0570A2CB168 /* DYChatComposer.swift */; };
+		C3DCBB85C8719998F00C3121 /* DYChatChromeSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4DCBB85C8719998F00C3121 /* DYChatChromeSnapshot.swift */; };
 		C394962922E8A5A51F4C0AAC /* DYPagingSpeed.swift in Sources */ = {isa = PBXBuildFile; fileRef = C494962922E8A5A51F4C0AAC /* DYPagingSpeed.swift */; };
 		C369373BAC99965B3ADD998F /* DYReadiness.swift in Sources */ = {isa = PBXBuildFile; fileRef = C469373BAC99965B3ADD998F /* DYReadiness.swift */; };
 		B2F00D0FEED0C0DE00000001 /* DYMessageNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2F00D0FEED0C0DE00000002 /* DYMessageNavigation.swift */; };
@@ -78,6 +98,26 @@
 		960FE5102A00176B7013B057 /* ShortVideoPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortVideoPlayer.swift; sourceTree = "<group>"; };
 		9E79B1B7855114828E14FCBA /* DouyinDuoLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinDuoLayout.swift; sourceTree = "<group>"; };
 		A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinFeedPipeline.swift; sourceTree = "<group>"; };
+		C434CA281E44DB627BB9552A /* DYForwardReceipt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYForwardReceipt.swift; sourceTree = "<group>"; };
+		C416A89F409CBA12ED5E9E78 /* DYStreakBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYStreakBadge.swift; sourceTree = "<group>"; };
+		C435F210A62AFA3B4B2A4D62 /* DYMessageSidebarLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYMessageSidebarLayout.swift; sourceTree = "<group>"; };
+		C47C532E59EF9FC51BB928D1 /* DYMessageRowBoundsKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYMessageRowBoundsKey.swift; sourceTree = "<group>"; };
+		C47E9C7CA6E9E8A226939369 /* DYMessageFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYMessageFixture.swift; sourceTree = "<group>"; };
+		C423C018389B0A24682CD818 /* DYMessageDivider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYMessageDivider.swift; sourceTree = "<group>"; };
+		C42E09ADBC9517A150D6F9EC /* DYDMProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYDMProbe.swift; sourceTree = "<group>"; };
+		C42C09859B8BC303ADE07658 /* DYDMBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYDMBanner.swift; sourceTree = "<group>"; };
+		C4F0FE69C21E713101981B85 /* DYConversationSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYConversationSync.swift; sourceTree = "<group>"; };
+		C468A4AE96D3BDFADE52EEE1 /* DYConversationStreak.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYConversationStreak.swift; sourceTree = "<group>"; };
+		C465ED149D2E52A3CFD5AA2E /* DYConversationCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYConversationCell.swift; sourceTree = "<group>"; };
+		C43F52DB025141406E2497FE /* DYChatWebBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatWebBridge.swift; sourceTree = "<group>"; };
+		C47187F1B941CA3F73D96D08 /* DYChatTextEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatTextEditor.swift; sourceTree = "<group>"; };
+		C44BA9EEDBD9F6A817CDBCEC /* DYChatOptionsPopover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatOptionsPopover.swift; sourceTree = "<group>"; };
+		C4155256CBFAA165DFB81156 /* DYChatImageCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatImageCache.swift; sourceTree = "<group>"; };
+		C4E34DE260D3A331669C700C /* DYChatHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatHeader.swift; sourceTree = "<group>"; };
+		C4E37A4111BFC1CA3C4E56FC /* DYChatComposerModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatComposerModel.swift; sourceTree = "<group>"; };
+		C4C3BC84A387674CD3FAB842 /* DYChatComposerBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatComposerBridge.swift; sourceTree = "<group>"; };
+		C453859F2CD8B0570A2CB168 /* DYChatComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatComposer.swift; sourceTree = "<group>"; };
+		C4DCBB85C8719998F00C3121 /* DYChatChromeSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYChatChromeSnapshot.swift; sourceTree = "<group>"; };
 		C494962922E8A5A51F4C0AAC /* DYPagingSpeed.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYPagingSpeed.swift; sourceTree = "<group>"; };
 		C469373BAC99965B3ADD998F /* DYReadiness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYReadiness.swift; sourceTree = "<group>"; };
 		B2F00D0FEED0C0DE00000002 /* DYMessageNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DYMessageNavigation.swift; sourceTree = "<group>"; };
@@ -126,6 +166,26 @@
 				D66F335DE5A601EA019AD61E /* DouyinExtras.swift */,
 				F08DC47FE80818A237A7BDE3 /* DouyinFeatureProbe.swift */,
 				A1F00D0FEED0C0DE00000002 /* DouyinFeedPipeline.swift */,
+				C434CA281E44DB627BB9552A /* DYForwardReceipt.swift */,
+				C416A89F409CBA12ED5E9E78 /* DYStreakBadge.swift */,
+				C435F210A62AFA3B4B2A4D62 /* DYMessageSidebarLayout.swift */,
+				C47C532E59EF9FC51BB928D1 /* DYMessageRowBoundsKey.swift */,
+				C47E9C7CA6E9E8A226939369 /* DYMessageFixture.swift */,
+				C423C018389B0A24682CD818 /* DYMessageDivider.swift */,
+				C42E09ADBC9517A150D6F9EC /* DYDMProbe.swift */,
+				C42C09859B8BC303ADE07658 /* DYDMBanner.swift */,
+				C4F0FE69C21E713101981B85 /* DYConversationSync.swift */,
+				C468A4AE96D3BDFADE52EEE1 /* DYConversationStreak.swift */,
+				C465ED149D2E52A3CFD5AA2E /* DYConversationCell.swift */,
+				C43F52DB025141406E2497FE /* DYChatWebBridge.swift */,
+				C47187F1B941CA3F73D96D08 /* DYChatTextEditor.swift */,
+				C44BA9EEDBD9F6A817CDBCEC /* DYChatOptionsPopover.swift */,
+				C4155256CBFAA165DFB81156 /* DYChatImageCache.swift */,
+				C4E34DE260D3A331669C700C /* DYChatHeader.swift */,
+				C4E37A4111BFC1CA3C4E56FC /* DYChatComposerModel.swift */,
+				C4C3BC84A387674CD3FAB842 /* DYChatComposerBridge.swift */,
+				C453859F2CD8B0570A2CB168 /* DYChatComposer.swift */,
+				C4DCBB85C8719998F00C3121 /* DYChatChromeSnapshot.swift */,
 				C494962922E8A5A51F4C0AAC /* DYPagingSpeed.swift */,
 				C469373BAC99965B3ADD998F /* DYReadiness.swift */,
 				B2F00D0FEED0C0DE00000002 /* DYMessageNavigation.swift */,
@@ -306,6 +366,26 @@
 				85C30C1C9411C32D14761E7A /* DouyinExtras.swift in Sources */,
 				7F8AAD69DE737D7DD8DEBA42 /* DouyinFeatureProbe.swift in Sources */,
 				A1F00D0FEED0C0DE00000001 /* DouyinFeedPipeline.swift in Sources */,
+				C334CA281E44DB627BB9552A /* DYForwardReceipt.swift in Sources */,
+				C316A89F409CBA12ED5E9E78 /* DYStreakBadge.swift in Sources */,
+				C335F210A62AFA3B4B2A4D62 /* DYMessageSidebarLayout.swift in Sources */,
+				C37C532E59EF9FC51BB928D1 /* DYMessageRowBoundsKey.swift in Sources */,
+				C37E9C7CA6E9E8A226939369 /* DYMessageFixture.swift in Sources */,
+				C323C018389B0A24682CD818 /* DYMessageDivider.swift in Sources */,
+				C32E09ADBC9517A150D6F9EC /* DYDMProbe.swift in Sources */,
+				C32C09859B8BC303ADE07658 /* DYDMBanner.swift in Sources */,
+				C3F0FE69C21E713101981B85 /* DYConversationSync.swift in Sources */,
+				C368A4AE96D3BDFADE52EEE1 /* DYConversationStreak.swift in Sources */,
+				C365ED149D2E52A3CFD5AA2E /* DYConversationCell.swift in Sources */,
+				C33F52DB025141406E2497FE /* DYChatWebBridge.swift in Sources */,
+				C37187F1B941CA3F73D96D08 /* DYChatTextEditor.swift in Sources */,
+				C34BA9EEDBD9F6A817CDBCEC /* DYChatOptionsPopover.swift in Sources */,
+				C3155256CBFAA165DFB81156 /* DYChatImageCache.swift in Sources */,
+				C3E34DE260D3A331669C700C /* DYChatHeader.swift in Sources */,
+				C3E37A4111BFC1CA3C4E56FC /* DYChatComposerModel.swift in Sources */,
+				C3C3BC84A387674CD3FAB842 /* DYChatComposerBridge.swift in Sources */,
+				C353859F2CD8B0570A2CB168 /* DYChatComposer.swift in Sources */,
+				C3DCBB85C8719998F00C3121 /* DYChatChromeSnapshot.swift in Sources */,
 				C394962922E8A5A51F4C0AAC /* DYPagingSpeed.swift in Sources */,
 				C369373BAC99965B3ADD998F /* DYReadiness.swift in Sources */,
 				B2F00D0FEED0C0DE00000001 /* DYMessageNavigation.swift in Sources */,

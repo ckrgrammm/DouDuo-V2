@@ -996,11 +996,14 @@ struct DYListPlayer: View {
     @State private var loadingMore = false
     /// 从消息点评论进来：自动开评论区并定位那条评论
     let commentFocus: DYCommentFocus?
+    /// 信息里点开的分享视频（上游 1.5.2）：关掉即停声。本分支的播放器拆页时已经停掉 AVPlayer，这里只留日志
+    let hardStopOnDismiss: Bool
 
     init(bridge: DouyinBridge, title: String, items: [DYAweme], start: Int,
          loadMore: (() async -> [DYAweme])? = nil, startPosition: Double? = nil, previewPlayer: AVPlayer? = nil, onAuthor: @escaping (DYAweme) -> Void,
-         commentFocus: DYCommentFocus? = nil) {
+         commentFocus: DYCommentFocus? = nil, hardStopOnDismiss: Bool = false) {
         self.bridge = bridge; self.title = title
+        self.hardStopOnDismiss = hardStopOnDismiss
         self.commentFocus = commentFocus
         _showComments = State(initialValue: commentFocus != nil)
         _items = State(initialValue: items)
@@ -1115,7 +1118,10 @@ struct DYListPlayer: View {
             }
         }
         .onAppear { if let i = items.firstIndex(where: { $0.id == currentID }) { preloader.update(items, current: i) } }
-        .onDisappear { preloader.clear() }
+        .onDisappear {
+            preloader.clear()
+            if hardStopOnDismiss { DYLiveModel.log("DDSHAREPLAY close") }
+        }
     }
 
     private func show(_ s: String) {
