@@ -1017,12 +1017,27 @@ struct PlayerPage: View {
             try? AVAudioSession.sharedInstance().setActive(true)
             p.play()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+        // 真失败（status=failed）不用等满：1 秒时就换路
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            guard isActive, isPlaying, player === p, !seeking, vlc == nil,
+                  p.currentItem?.status == .failed else { return }
+            logStartDiag(p)
+            recover()
+        }
+        // 只是还在加载（status=unknown）给到 5 秒再判，别把正常加载中的长视频误判成卡死
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
             let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
             guard stuck else { return }
+            logStartDiag(p)
             recover()
         }
+    }
+
+    private func logStartDiag(_ p: AVPlayer) {
+        let st = p.currentItem?.status.rawValue ?? -1
+        let err = p.currentItem?.error.map { "\(($0 as NSError).domain)/\(($0 as NSError).code)" } ?? "-"
+        DYLiveModel.log("DDSTARTDIAG \(id) status=\(st) err=\(err) host=\(url.host ?? "-") alt=\(altURL?.host ?? "-") retried=\(avRetried)")
     }
 
     /// 起播失败的统一出路：先换备用地址重建一次，还不行交给 VLC
@@ -1141,6 +1156,8 @@ struct PlayerPage: View {
                 if !firstFrame, t.seconds > 0.02 { firstFrame = true }
                 if isActive { DDNowPlaying.id = id; DDNowPlaying.time = t.seconds }
                 if isActive, p.rate > 0 { DDAudioGuard.reassert(id) }
+                // 起播 / 卡顿等数据时让缓存下载让路（否则长视频被后台下载抢带宽，上游实测等 12 秒）
+                if isActive { DYVideoCache.shared.reportPlaybackWaiting(p.timeControlStatus == .waitingToPlayAtSpecifiedRate) }
                 dmClock.sync(t.seconds, playing: p.rate > 0 && !seeking, rate: Double(p.rate))
                 refreshNowPlaying(t.seconds)
                 // 锁定倍速：play()/换播放器都会回到 1 倍，每 0.25s 拉回选定速度
@@ -1276,6 +1293,7 @@ struct PlayerPage: View {
     }
 
     private func teardown() {
+        if isActive { DYVideoCache.shared.reportPlaybackWaiting(false) }
         cancelUpgrade()
         if let v = vlc { onSavePosition(v.current); v.onEnd = nil; v.onProgress = nil; v.stop(); vlc = nil }
         if let p = player { onSavePosition(p.currentTime().seconds) }

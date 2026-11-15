@@ -1249,12 +1249,16 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       const def = pickPlay(urls), br = bestRate(v), best = br ? pickPlay(br.play_addr.url_list) : null;
       const fr = fastRate(v), fast = fr ? pickPlay(fr.play_addr.url_list) : null;
       const pd = v.play_addr || {};
-      // 备用地址：优先 /aweme/v1/play/ 跳转；不能和主地址相同（主地址本身就是跳转时退到默认档）
-      const main = best || def, redirect = pickRedirect(br ? br.play_addr.url_list : urls);
+      // 起播优先用 /aweme/v1/play/ 重定向地址（上游 1.5.2 实测：直连 CDN(douyinvod) 现在一律 403，
+      // 拿它起播会一直等到 AVPlayer 超时，黑屏 10–30 秒）。最优档没有重定向时找任意一档的重定向。
+      // playAlt 保留直连地址，只给缓存下载兜底，不再拿来起播。
+      const allURLs = [...urls, ...((v.bit_rate || []).flatMap(r => (r.play_addr && r.play_addr.url_list) || []))];
+      const direct = best || def, redirect = pickRedirect(br ? br.play_addr.url_list : urls) || pickRedirect(allURLs);
+      const main = redirect || direct;
       return {
         id: String(a.aweme_id), desc: a.desc || '', width: v.width || 0, height: v.height || 0, duration: (v.duration || 0) / 1000,
         play: main,
-        playAlt: redirect && redirect !== main ? redirect : (def && def !== main ? def : null),
+        playAlt: direct && direct !== main ? direct : null,
         playFast: fast && fast !== main ? fast : null,
         q: (br ? (br.gear_name || '?') + ' ' + resOf(br) + 'p h265=' + (br.is_h265 ? 1 : 0) + ' fmt=' + (br.format || '-') + ' ' + Math.round((br.bit_rate || 0) / 1000) + 'k' : 'nolist')
           + ' | def ' + (pd.width || 0) + 'x' + (pd.height || 0) + ' | gears ' + (v.bit_rate || []).map(r => (r.gear_name || '?') + ':' + Math.round((r.bit_rate || 0) / 1000) + 'k' + (r.is_h265 ? 'h' : '') + (r.format ? '/' + r.format : '')).join(',')
@@ -1924,7 +1928,16 @@ struct DouyinFeedScreen: View {
             #endif
             if tab == .live { return }   // 起手就是直播页（调试）时别把推荐流的播放器都拉起来
             // 秒开：先播上次缓存好、还没看过的；连接抖音 / 拉推荐在后台接着往后补
-            if feed.items.isEmpty, !DYFeedBench.isBenchRun, let saved = DYFeedSession.load() {
+            // 抖音播放地址带签名，隔一段时间就 403：拿旧地址起播会一直等到超时（上游实测等了 57 秒）。
+            // 所以只恢复「已经整条缓存在本地」的条目（切后台时 cacheForResume 会把当前条存下来），
+            // 当前条没缓存就整段不恢复，走下面的「缓存好、没看过的」秒开 + 新推荐。
+            if feed.items.isEmpty, !DYFeedBench.isBenchRun, var saved = DYFeedSession.load() {
+                saved.items = saved.items.filter { DYVideoCache.localURL($0.id) != nil }
+                if !saved.items.contains(where: { $0.id == saved.currentID }) {
+                    DYLiveModel.log("DDSESSION 当前条未缓存，地址可能已过期，不恢复")
+                    saved.items = []
+                }
+                if !saved.items.isEmpty {
                 feed.items = saved.items
                 resume.map = saved.positions
                 currentID = saved.currentID
@@ -1934,7 +1947,8 @@ struct DouyinFeedScreen: View {
                     if a.isCollect == 1 { feed.collected.insert(a.id) }
                 }
                 DDPerf.mark("feed.visible(session)")
-                DYLiveModel.log("DDSESSION 恢复 id=\(saved.currentID) t=\(saved.positions[saved.currentID] ?? 0)")
+                DYLiveModel.log("DDSESSION 恢复 id=\(saved.currentID) t=\(saved.positions[saved.currentID] ?? 0) n=\(saved.items.count)")
+                }
             }
             if feed.items.isEmpty {
                 // 没有会话：本地缓存好、没看过的按竖横比例挑出来先播
@@ -3203,7 +3217,8 @@ struct DYVideoPage: View {
                                         onDoubleTap: likeFromDoubleTap,
                                         onSavePosition: onSavePosition, onClose: {}, fillWidth: hSize == .compact && item.isTallFrame,
                                         danmaku: danmakuOn ? danmaku : [],
-                                        altURL: item.playAlt.flatMap(URL.init(string:)),
+                                        // 直连 CDN 现在 403：重试仍走重定向地址，再不行交 VLC（不切到直连干等）
+                                        altURL: nil,
                                         quality: item.q,
                                         fastURL: item.playFast.flatMap(URL.init(string:)),
                                         posterURL: item.cover.flatMap(URL.init(string:)),
