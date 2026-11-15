@@ -19,8 +19,10 @@ struct DYFeedSession: Codable {
     }
     static func load() -> DYFeedSession? {
         guard let data = try? Data(contentsOf: url),
-              let session = try? JSONDecoder().decode(Self.self, from: data),
+              var session = try? JSONDecoder().decode(Self.self, from: data),
               session.items.contains(where: { $0.id == session.currentID }) else { return nil }
+        var seen = Set<String>()
+        session.items = session.items.filter { seen.insert($0.id).inserted }
         return session
     }
     private static let queue = DispatchQueue(label: "douduo.feed-session", qos: .utility)
@@ -61,7 +63,7 @@ actor DYVideoCache {
     static let maxDuration: Double = 600
     /// 头部缓存字节数：约 6–20 秒（抖音码率 0.5–3 Mbps），够起播
     static let headBytes = 4_000_000
-    /// 后面几条做头部预取（刷过来不卡的关键）
+    /// 预加载窗口之后整条预下载几条（刷到时直接读本地，不再联网）
     static let headPrefetch = 2
     /// 保守按 3.2 Mbps 折算，宁可早一点切在线流，也不要播到没数据的尾部
     static let assumeBitsPerSecond: Double = 2_500_000
@@ -94,11 +96,17 @@ actor DYVideoCache {
         (UserDefaults.standard.object(forKey: countKey) as? Int) ?? defaultCount
     }
 
-    /// 已经整条下完的本地文件
+    /// 已经整条下完的本地文件。
+    /// 视频页每次重绘都会问（真机实测主线程 0.17s/30s 花在 fileExists 上）：结果记在内存里，
+    /// 缓存自己增删文件时立刻清掉；系统清理缓存目录这种外部变化最多 5 秒后重新检查。
     nonisolated static func localURL(_ id: String) -> URL? {
+        if let hit = existsMemo.get(id) { return hit ? fileURL(id) : nil }   // 命中时连路径都不拼（大多数是「没缓存」）
         let f = fileURL(id)
-        return FileManager.default.fileExists(atPath: f.path) ? f : nil
+        let exists = FileManager.default.fileExists(atPath: f.path)
+        existsMemo.set(id, exists)
+        return exists ? f : nil
     }
+    nonisolated static let existsMemo = DYFileExistsMemo()
 
     /// 头部缓存（够起播即可）
     nonisolated static func headFile(_ id: String) -> URL? {
@@ -153,32 +161,62 @@ actor DYVideoCache {
         }
     }
 
-    /// 播放焦点变了：缓存在播的这条（划走上一条就停），并预取后面几条的头部
-    func focus(current: DYAweme?, ahead: [DYAweme]) {
-        guard Self.limit > 0 else { job?.cancel(); job = nil; jobID = nil; return }
-        let target = current ?? ahead.first
-        guard let target else { return }
-        if jobID == target.id, job != nil { return }
-        job?.cancel()
-        job = nil
-        jobID = target.id
-        let follow = Array(ahead.dropFirst().prefix(Self.headPrefetch))
-        pending[target.id] = target
-        for a in follow { pending[a.id] = a }
-        job = Task { [weak self] in
-            guard let self else { return }
-            await self.sweepSilent()
-            await self.store(id: target.id)
-            for a in follow {
-                if Task.isCancelled { return }
-                await self.store(id: a.id)
-            }
+    /// 每条视频只下载一次：
+    /// - 在播这条和预加载窗口里的几条（`skip` 条）由播放器 / 预加载播放器在线流式播放，这里不碰；
+    /// - 只整条下载窗口之后的 `headPrefetch` 条。它们刷进预加载窗口时，预加载器读到本地文件直接用，不再联网。
+    /// 正在下的那条还在目标里就让它下完；已经掉进预加载窗口（会被在线流播放）或被划过的立即取消。
+    func focus(ahead: [DYAweme], skip: Int) {
+        guard Self.limit > 0 else { stopCaching(); return }
+        // 机身发烫或省电模式：不额外下载，播放照常在线流式
+        let info = ProcessInfo.processInfo
+        if info.thermalState == .serious || info.thermalState == .critical || info.isLowPowerModeEnabled {
+            stopCaching(); return
         }
+        let count = info.thermalState == .nominal ? Self.headPrefetch : 1
+        let targets = Array(ahead.dropFirst(max(0, skip))
+            .filter { $0.images.isEmpty && $0.play != nil && $0.duration <= Self.maxDuration
+                && Self.localURL($0.id) == nil && !failed.contains($0.id) }
+            .prefix(count))
+        for a in targets { pending[a.id] = a }
+        queue = targets.map(\.id)
+        if let inflight = jobID, !queue.contains(inflight) {
+            job?.cancel(); job = nil; jobID = nil
+        }
+        guard job == nil, !queue.isEmpty else { return }
+        jobGeneration &+= 1
+        let generation = jobGeneration
+        job = Task { [weak self] in await self?.drain(generation) }
+    }
+
+    private var queue: [String] = []
+    private var jobGeneration = 0
+
+    private func drain(_ generation: Int) async {
+        await sweepSilent()
+        while !Task.isCancelled, generation == jobGeneration,
+              let id = queue.first(where: { Self.localURL($0) == nil && !failed.contains($0) }) {
+            jobID = id
+            await store(id: id)
+            queue.removeAll { $0 == id }
+        }
+        if generation == jobGeneration { job = nil; jobID = nil }
     }
 
     /// 划走 / 离开：立刻停止缓存
+    /// 离开 App 时把正在看的这条整条存下来：下次打开恢复会话时直接读本地，不用等网络（也不怕播放地址过期）。
+    /// 平时刷视频「每条只下载一次」，当前条交给播放器在线流式播放、不另外下载；
+    /// 只有退到后台这一下，为了「回来秒开」多下这一条。已经缓存过的直接跳过。
+    func cacheForResume(_ a: DYAweme) async {
+        guard Self.limit > 0, a.images.isEmpty, a.play != nil, a.duration <= Self.maxDuration,
+              Self.localURL(a.id) == nil, !failed.contains(a.id) else { return }
+        pending[a.id] = a
+        DYLiveModel.log("DDCACHE resume start \(a.id)")
+        await storeFull(id: a.id)
+    }
+
     func stopCaching() {
-        job?.cancel(); job = nil; jobID = nil
+        job?.cancel(); job = nil; jobID = nil; queue = []
+        jobGeneration &+= 1
     }
 
     /// 只缓存整条视频：不再存「头部」，也就没有「头部播完接在线流」那一下切换
@@ -251,13 +289,14 @@ actor DYVideoCache {
                 let dst = Self.fileURL(a.id)
                 try? FileManager.default.removeItem(at: dst)
                 try FileManager.default.moveItem(at: tmp, to: dst)
+                Self.existsMemo.clear()
                 let bytes = ((try? FileManager.default.attributesOfItem(atPath: dst.path)[.size]) as? Int) ?? 0
-                guard bytes > 50_000 else { try? FileManager.default.removeItem(at: dst); continue }
+                guard bytes > 50_000 else { try? FileManager.default.removeItem(at: dst); Self.existsMemo.clear(); continue }
                 // 有些条目的下载地址给的是「只有画面」的分轨流（声音另一路）。这种文件缓存下来，
                 // 刷到时走本地播放就是有画面没声音，要等它被淘汰、回到在线流才有声。
                 // 没有音轨的文件不留，换下一个地址；都没有就不缓存，直接走在线流。
                 guard await Self.hasAudio(dst) else {
-                    try? FileManager.default.removeItem(at: dst)
+                    try? FileManager.default.removeItem(at: dst); Self.existsMemo.clear()
                     DYLiveModel.log("DDCACHE drop no-audio \(a.id) \(bytes / 1024)KB host=\(u.host ?? "-")")
                     continue
                 }
@@ -287,7 +326,7 @@ actor DYVideoCache {
         for e in entries {
             let f = Self.fileURL(e.aweme.id)
             guard FileManager.default.fileExists(atPath: f.path), !(await Self.hasAudio(f)) else { continue }
-            try? FileManager.default.removeItem(at: f)
+            try? FileManager.default.removeItem(at: f); Self.existsMemo.clear()
             entries.removeAll { $0.aweme.id == e.aweme.id }
             DYLiveModel.log("DDCACHE sweep no-audio \(e.aweme.id)")
         }
@@ -310,6 +349,7 @@ actor DYVideoCache {
         entries = []; heads = []
         if let files = try? FileManager.default.contentsOfDirectory(at: Self.dir, includingPropertiesForKeys: nil) {
             for f in files { try? FileManager.default.removeItem(at: f) }
+            Self.existsMemo.clear()
         }
         return bytes
     }
@@ -320,7 +360,7 @@ actor DYVideoCache {
         while entries.count > lim || (entries.count > 1 && entries.reduce(0, { $0 + $1.bytes }) > Self.maxBytes) {
             let idx = entries.firstIndex(where: \.watched) ?? 0
             let e = entries.remove(at: idx)
-            try? FileManager.default.removeItem(at: Self.fileURL(e.aweme.id))
+            try? FileManager.default.removeItem(at: Self.fileURL(e.aweme.id)); Self.existsMemo.clear()
         }
     }
 
@@ -330,4 +370,21 @@ actor DYVideoCache {
     private func saveHeads() {
         if let d = try? JSONEncoder().encode(heads) { try? d.write(to: Self.headIndexURL, options: .atomic) }
     }
+}
+
+/// localURL 的存在性小缓存（线程安全；5 秒过期）
+final class DYFileExistsMemo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: (exists: Bool, at: TimeInterval)] = [:]
+    func get(_ id: String) -> Bool? {
+        lock.lock(); defer { lock.unlock() }
+        guard let v = values[id], ProcessInfo.processInfo.systemUptime - v.at < 5 else { return nil }
+        return v.exists
+    }
+    func set(_ id: String, _ exists: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if values.count > 500 { values.removeAll() }
+        values[id] = (exists, ProcessInfo.processInfo.systemUptime)
+    }
+    func clear() { lock.lock(); values.removeAll(); lock.unlock() }
 }

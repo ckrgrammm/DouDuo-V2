@@ -153,31 +153,15 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
     @Published var canGoBack = false
     @Published var progress: Double = 0
     weak var web: WKWebView?
+    /// 网页 postMessage("ddMsg") 转给 App（如聊天页点分享视频 → 跳原生播放）
+    var onAppMessage: ((String) -> Void)?
     private var clickedLogin = false
     private var filledPhone = false
     private var filledCode = false
     private var observers: [NSKeyValueObservation] = []
 
-    #if DEBUG
-    private var cmdTimer: Timer?
-    #endif
-
     func attach(_ wv: WKWebView) {
         web = wv
-        #if DEBUG
-        // 调试遥控：往 Documents/dd-cmd.js 写一段 JS，网页版里执行，结果写 dd-cmd.out（只在 DEBUG，模拟器调试用）
-        cmdTimer?.invalidate()
-        cmdTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let f = dir.appendingPathComponent("dd-cmd.js")
-            guard let js = try? String(contentsOf: f, encoding: .utf8) else { return }
-            try? FileManager.default.removeItem(at: f)
-            self?.web?.evaluateJavaScript(js) { r, e in
-                let out = "\(r.map { String(describing: $0) } ?? "nil") \(e.map { String(describing: $0) } ?? "")"
-                try? out.write(to: dir.appendingPathComponent("dd-cmd.out"), atomically: true, encoding: .utf8)
-            }
-        }
-        #endif
         observers = [
             wv.observe(\.estimatedProgress, options: [.new]) { [weak self] w, _ in
                 let p = w.estimatedProgress
@@ -301,6 +285,80 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
     }
 }
 
+/// 网页 → App 消息通道：window.webkit.messageHandlers.ddMsg.postMessage(JSON)
+final class DDAppMessageHandler: NSObject, WKScriptMessageHandler {
+    private let model: DouyinWebModel
+    init(_ model: DouyinWebModel) { self.model = model }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if let s = message.body as? String { model.onAppMessage?(s) }
+    }
+}
+
+/// 聊天页点「分享视频」卡片 → 拦下点击、抽出 aweme_id 发给 App 跳原生播放（只在 /chat 页生效，别处不动）
+/// 卡片通常是缩略图不是 <video>：从点击处向上找含媒体特征的消息卡，再从 React props 抽 aweme_id；
+/// 抽不到就把卡片 HTML / 类名回传（video-miss / video-probe），用来迭代选择器。
+private let ddVideoTapHookJS = #"""
+(() => {
+  if (window.__ddVideoTapHook) return; window.__ddVideoTapHook = 1;
+  const post = (o) => { try { window.webkit.messageHandlers.ddMsg.postMessage(JSON.stringify(o)); } catch (e) {} };
+  const findID = (root) => {
+    // Verified IM ShareAweme payload: message.parsedContent (aweType=800).
+    // Never infer an aweme ID from a user/message ID or an arbitrary DOM attribute.
+    const fromMessage = message => {
+      try {
+        const payload = message.parsedContent || JSON.parse(message.content || 'null');
+        const id = payload?.itemId;
+        return Number(payload?.aweType) === 800 && typeof id === 'string' && /^\d{15,25}$/.test(id) ? id : null;
+      } catch (_) { return null; }
+    };
+    const seen = new Set();
+    for (let n = root, d = 0; n && d < 12; n = n.parentElement, d++) {
+      for (const k of Object.keys(n)) {
+        if (k.startsWith('__reactProps')) {
+          const message = n[k]?.message;
+          if (message) return fromMessage(message);
+        }
+        if (!k.startsWith('__reactFiber') && !k.startsWith('__reactInternalInstance')) continue;
+        for (let f = n[k], depth = 0; f && depth < 24 && !seen.has(f); f = f.return, depth++) {
+          seen.add(f);
+          const message = f.memoizedProps?.message;
+          // Stop at this card's nearest message. Never read a sibling/conversation payload.
+          if (message) return fromMessage(message);
+        }
+      }
+      if (n.matches?.('[data-e2e="message-item"]')) break;
+    }
+    return null;
+  };
+  document.addEventListener('click', (ev) => {
+    try {
+      if (!/\/chat/.test(location.pathname)) return;
+      const t = ev.target;
+      const pane = t.closest('[class*="componentsRightPanel"],[class*="rightPanel"]');
+      if (!pane) return;
+      // 实测类名：分享视频卡 = MessageItemShareAweme* / BulletBulletVideo*
+      const media = t.closest('[class*="ShareAweme"],[class*="BulletBulletVideo"],[class*="videoCard"],[class*="VideoCard"]');
+      if (!media) return;
+      // 严格向上找第一个「消息项」祖先（closest 会命中自身，不能用）
+      let card = null;
+      for (let n = media.parentElement; n && n !== pane; n = n.parentElement) {
+        if (String(n.className || '').includes('MessageItem')) { card = n; break; }
+      }
+      if (!card) card = media;
+      const id = findID(card);
+      if (id) {
+        ev.preventDefault(); ev.stopPropagation();
+        console.log('DDVIDEOTAP jump ' + id);
+        post({type: 'video', id: id});
+        return;
+      }
+      // Leave unsupported cards to the official web UI; don't guess an ID.
+      post({type: 'video-miss', html: 'shared-video-payload-unavailable'});
+    } catch (e) {}
+  }, true);
+})();
+"""#
+
 struct DouyinWebContainer: UIViewRepresentable {
     @ObservedObject var model: DouyinWebModel
     let zoom: Double
@@ -321,6 +379,12 @@ struct DouyinWebContainer: UIViewRepresentable {
             WKUserScript(source: DouyinWeb.bootstrapJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         cfg.userContentController.addUserScript(
             WKUserScript(source: DouyinWeb.bootstrapJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        // 聊天页点分享视频 → 抽 aweme_id 发给 App（只在 /chat 页生效）
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: ddVideoTapHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // 网页 → App 消息通道
+        cfg.userContentController.add(DDAppMessageHandler(model), name: "ddMsg")
+        DYLiveModel.log("DDMSG ddmsg-handler registered")
         // 电脑版直播间的播放器要 MediaSource，iPhone 的 WebView 只有 ManagedMediaSource（iOS 17.1+），
         // 没有它就一直「直播加载中」。这里把它补成 MediaSource；ManagedMediaSource 要求关掉隔空播放才能挂到 <video> 上
         cfg.userContentController.addUserScript(WKUserScript(source: """

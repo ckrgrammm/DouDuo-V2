@@ -11,6 +11,10 @@ final class ImageCache {
     private let cache = NSCache<NSURL, UIImage>()
     // 正在下载中的任务，避免同一 URL 并发重复下载
     private var inflight: [URL: Task<UIImage?, Never>] = [:]
+    // 正在取原始字节 / 正在解码缩略图的任务：预加载和页面同时要同一张时只做一次
+    private var dataInflight: [URL: Task<Data?, Never>] = [:]
+    fileprivate var thumbInflight: [URL: Task<UIImage?, Never>] = [:]
+    fileprivate func withInflightLock<T>(_ body: () -> T) -> T { lock.withLock(body) }
     private let lock = NSLock()
     // 磁盘缓存目录（持久化，跨启动不丢；内存缓存清空/重启后从这里秒读）
     private let diskDir: URL
@@ -78,10 +82,53 @@ final class ImageCache {
     func diskCachedAsync(_ url: URL) async -> UIImage? {
         let path = diskPath(url)
         guard let data = try? Data(contentsOf: path) else { return nil }
-        guard let img = UIImage(data: data) else { return nil }
+        guard let img = Self.decoded(data) else {
+            // 盘上不是图片（以前把错误页也存了下来）：删掉，下次重新下载
+            try? FileManager.default.removeItem(at: path)
+            return nil
+        }
         let cost = img.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
         cache.setObject(img, forKey: url as NSURL, cost: cost)
         return img
+    }
+
+    /// 在当前（后台）线程把图解码好。UIImage(data:) 是懒解码，不处理的话第一次上屏会在主线程解码，
+    /// 正好卡在滑动 / 翻页动画里。
+    nonisolated static func decoded(_ data: Data) -> UIImage? {
+        guard let img = UIImage(data: data) else { return nil }
+        return img.preparingForDisplay() ?? img
+    }
+
+    /// 原始字节：磁盘 → 网络（成功后写盘）。不建 UIImage、不占内存缓存；同一 URL 并发只取一次。
+    /// 网络失败重试一次，单次 15 秒超时——默认 60 秒会让一张坏图转很久。
+    func data(for url: URL) async -> Data? {
+        var created = false
+        let task: Task<Data?, Never> = lock.withLock {
+            if let running = dataInflight[url] { return running }
+            created = true
+            let fresh = Task<Data?, Never>(priority: .userInitiated) { await self.fetchData(url) }
+            dataInflight[url] = fresh
+            return fresh
+        }
+        let result = await task.value
+        if created { lock.withLock { dataInflight[url] = nil } }
+        return result
+    }
+
+    private func fetchData(_ url: URL) async -> Data? {
+        if let disk = diskData(url) { return disk }
+        for attempt in 0..<2 {
+            var req = URLRequest(url: url, timeoutInterval: 15)
+            req.cachePolicy = .returnCacheDataElseLoad
+            if let (data, resp) = try? await URLSession.shared.data(for: req), !data.isEmpty,
+               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true {
+                let path = diskPath(url)
+                io.async { try? data.write(to: path, options: .atomic) }
+                return data
+            }
+            if attempt == 0 { try? await Task.sleep(for: .milliseconds(400)) }
+        }
+        return nil
     }
 
     /// 读原图磁盘缓存的原始字节（后台线程调用）
@@ -123,18 +170,10 @@ final class ImageCache {
 
     private func makeLoadTask(_ url: URL) -> Task<UIImage?, Never> {
         Task<UIImage?, Never> {
-            do {
-                // 磁盘命中（后台线程读，不卡 UI）
-                if let disk = await self.diskCachedAsync(url) { return disk }
-                let data: Data
-                var req = URLRequest(url: url)
-                req.cachePolicy = .returnCacheDataElseLoad
-                (data, _) = try await URLSession.shared.data(for: req)
-                // 写磁盘持久化（后台队列，不阻塞）
-                let path = self.diskPath(url)
-                self.io.async { try? data.write(to: path, options: .atomic) }
-                return UIImage(data: data)
-            } catch { return nil }
+            // 磁盘命中（后台线程读，不卡 UI）
+            if let disk = await self.diskCachedAsync(url) { return disk }
+            guard let data = await self.data(for: url) else { return nil }
+            return Self.decoded(data)
         }
     }
 }
@@ -152,18 +191,27 @@ extension ImageCache {
         memoryCached(thumbKey(url, maxPixel))
     }
 
-    /// 后台下采样：原图优先用内存/磁盘缓存的数据，没有才走 load() 下载（顺带写盘）
+    /// 后台下采样：直接从原始字节按目标尺寸解码。
+    /// 以前是「下载 → 建整张 UIImage 进内存缓存 → 转成 JPEG → 再下采样」：一张 2160×2880 的图要整张解码、
+    /// 重新编码再解码一次，而且整张图按 25MB 计入内存缓存，十几张图的图文会把已经解好的缩略图挤出去
+    /// （翻到后面几张又变黑、重新加载）。现在只解一次缩略图，原图不进内存。
     func loadThumb(_ url: URL, maxPixel: Int) async -> UIImage? {
         let key = thumbKey(url, maxPixel)
         if let hit = memoryCached(key) { return hit }
-        let thumb: UIImage? = await Task.detached(priority: .userInitiated) { [self] () -> UIImage? in
-            var data = diskData(url)
-            if data == nil, let full = await self.load(url) {
-                data = diskData(url) ?? full.jpegData(compressionQuality: 0.9)
+        var created = false
+        let task: Task<UIImage?, Never> = withInflightLock {
+            if let running = thumbInflight[key] { return running }
+            created = true
+            let fresh = Task.detached(priority: .userInitiated) { [self] () -> UIImage? in
+                guard let data = await self.data(for: url) else { return nil }
+                return Self.downsample(data, maxPixel: maxPixel)
             }
-            guard let data else { return nil }
-            return Self.downsample(data, maxPixel: maxPixel)
-        }.value
+            thumbInflight[key] = fresh
+            return fresh
+        }
+        let thumb = await task.value
+        guard created else { return thumb }
+        withInflightLock { thumbInflight[key] = nil }
         if let thumb {
             let cost = thumb.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
             storeMemory(thumb, for: key, cost: cost)
@@ -271,19 +319,19 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
                 uiImage = hit
                 return
             }
-            if let maxPixel = thumbnailMaxPixel {
-                if let img = await ImageCache.shared.loadThumb(url, maxPixel: maxPixel) {
-                    uiImage = img
+            // 失败后隔一会儿再试一次（弱网抖一下不该让这张图一直空着）
+            for attempt in 0..<2 {
+                let img: UIImage?
+                if let maxPixel = thumbnailMaxPixel {
+                    img = await ImageCache.shared.loadThumb(url, maxPixel: maxPixel)
                 } else {
-                    failed = true
+                    img = await ImageCache.shared.load(url)
                 }
-                return
+                if let img { uiImage = img; return }
+                guard attempt == 0 else { break }
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
             }
-            if let img = await ImageCache.shared.load(url) {
-                uiImage = img
-            } else {
-                failed = true
-            }
+            failed = true
         }
     }
 }

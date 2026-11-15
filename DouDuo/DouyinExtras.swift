@@ -3,6 +3,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import AVKit
 import Photos
 
 // MARK: - 数据
@@ -206,10 +207,11 @@ extension DouyinBridge {
     }
 
     /// 发评论 / 回复评论（replyID 非空 = 回复那条）
-    func publishComment(_ awemeID: String, text: String, replyID: String? = nil) async throws -> DYComment {
+    /// 回复楼中楼：replyID = 一级评论 cid，replyToReplyID = 被回复的那条楼中楼 cid
+    func publishComment(_ awemeID: String, text: String, replyID: String? = nil, replyToReplyID: String? = nil) async throws -> DYComment {
         invalidateReadCache()
         defer { invalidateReadCache() }
-        let d = try await call(Self.publishJS, args: ["id": awemeID, "text": text, "reply": replyID ?? "0"], attempts: 1)
+        let d = try await call(Self.publishJS, args: ["id": awemeID, "text": text, "reply": replyID ?? "0", "replyTo": replyToReplyID ?? "0"], attempts: 1)
         let r = try JSONDecoder().decode(DYPublishResp.self, from: d)
         DYLiveModel.log("DDSEND comment status=\(r.status) code=\(r.code ?? -1) msg=\(r.msg ?? "-") diag=\(r.diagnostic ?? "-")")
         if r.status == Self.guardRefusedStatus { throw DYError.bad(Self.guardRefusedMessage) }
@@ -260,7 +262,7 @@ extension DouyinBridge {
     static let publishJS = cmap + #"""
     const P = q({ app_name: 'aweme', enter_from: 'video_detail', previous_page: 'video_detail' });
     const body = new URLSearchParams({ aweme_id: id, text: text, text_extra: '[]', comment_send_celltime: '0', comment_video_celltime: '0' });
-    if (reply && reply !== '0') { body.set('reply_id', reply); body.set('reply_to_reply_id', '0'); }
+    if (reply && reply !== '0') { body.set('reply_id', reply); body.set('reply_to_reply_id', (replyTo && replyTo !== '0') ? replyTo : '0'); }
     const r = await req('POST', '/aweme/v1/web/comment/publish?' + P, body.toString());
     const raw = r.t || '', parsed = parse(raw), d = parsed || {};
     const kind = !raw.trim() ? 'empty' : parsed !== null ? 'json' : /^\s*</.test(raw) ? 'html' : 'other';
@@ -578,29 +580,67 @@ struct DYDanmakuClock {
 final class DDThermal: ObservableObject {
     static let shared = DDThermal()
     @Published private(set) var state = ProcessInfo.processInfo.thermalState
+    private var heartbeat: Timer?
     private init() {
+        Self.log("launch")
+        // 音频会话被打断（来电、别的 App、App 内另一路播放器）都记进 ddlog，排查「视频停、音乐接着放」
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
+                                               object: nil, queue: .main) { note in
+            let info = note.userInfo ?? [:]
+            let type = (info[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue ? "began" : "ended"
+            let reason = (info[AVAudioSessionInterruptionReasonKey] as? UInt).map(String.init) ?? "-"
+            let resume = (info[AVAudioSessionInterruptionOptionKey] as? UInt).map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) ? "1" : "0" } ?? "-"
+            DYLiveModel.log("DDAUDIO interruption \(type) reason=\(reason) shouldResume=\(resume) appState=\(UIApplication.shared.applicationState.rawValue)")
+        }
         NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
                                                object: nil, queue: .main) { [weak self] _ in
+            let old = self?.state
             self?.state = ProcessInfo.processInfo.thermalState
+            Self.log("change from=\(old.map(Self.label) ?? "-")")
+        }
+        // 每分钟记一次当前温度档，方便对照日志里同一时段在做什么（直播 / 预加载 / 刷视频）
+        let t = Timer(timeInterval: 60, repeats: true) { _ in Self.log("tick") }
+        t.tolerance = 10
+        RunLoop.main.add(t, forMode: .common)
+        heartbeat = t
+    }
+
+    /// 系统不给 App 读真实温度（摄氏度），只有 thermalState 四档：
+    /// nominal 正常 / fair 微热 / serious 烫（系统开始降频）/ critical 很烫
+    static func label(_ s: ProcessInfo.ThermalState) -> String {
+        switch s {
+        case .nominal: return "nominal(正常)"
+        case .fair: return "fair(微热)"
+        case .serious: return "serious(烫)"
+        case .critical: return "critical(很烫)"
+        @unknown default: return "unknown(\(s.rawValue))"
         }
     }
-    /// 弹幕重绘的最小帧间隔：常温跟屏幕刷新率（120Hz），发热后降到 60 / 30，
+
+    /// 写 ddlog：DDTHERMAL <事件> state=… t=启动后秒数 lowPower=0/1
+    static func log(_ event: String) {
+        let info = ProcessInfo.processInfo
+        let elapsed = Int(Date().timeIntervalSince1970 - DDPerf.t0)
+        DYLiveModel.log("DDTHERMAL \(event) state=\(label(info.thermalState)) t=\(elapsed)s lowPower=\(info.isLowPowerModeEnabled ? 1 : 0)")
+    }
+    /// 弹幕重绘的最小帧间隔：常温 60Hz，发热后降到 45 / 30，
     /// 把 GPU / 主线程让给视频解码。弹幕位置按时间算，降帧不影响时间轴。
     var danmakuFrameInterval: Double? {
         switch state {
-        case .nominal: return nil
-        case .fair: return 1.0 / 60
+        case .nominal: return 1.0 / 60   // 弹幕 60 帧已足够顺滑；跟 ProMotion 跑 120 帧是双倍的 CPU / GPU / 合成开销
+        case .fair: return 1.0 / 45
         default: return 1.0 / 30
         }
     }
 }
 
-/// 位置用 TimelineView(.animation) 逐帧算（跟屏幕刷新率走，ProMotion 上 120Hz），不靠 SwiftUI 补间动画。
+/// 弹幕交给 Core Animation 移动：每条弹幕只排版成一张带阴影的小图一次，由系统渲染服务按匀速动画平移。
+/// 以前用 TimelineView 逐帧在主线程重建 Canvas 和文字（真机 Time Profiler：弹幕在屏时约占主线程 1/4），
+/// 现在主线程只在播放时钟每 0.25 秒同步时补发即将出现的弹幕、处理暂停 / 拖动 / 倍速。
 struct DYDanmakuLayer: View {
     let items: [DYDanmaku]
     let clock: DYDanmakuClock
     let topInset: CGFloat
-    @ObservedObject private var thermal = DDThermal.shared
     @AppStorage(DYDanmakuPolicy.densityKey) private var densityRaw = DYDanmakuPolicy.Density.standard.rawValue
     @AppStorage(DYDanmakuPolicy.deduplicateKey) private var deduplicate = true
 
@@ -621,36 +661,164 @@ struct DYDanmakuLayer: View {
             let speed = (w + 200) / 7
             let placed = DYDanmakuLayout.shared.get(renderItems, w: w, lanes: region.lanes, speed: speed,
                                                   density: density, deduplicate: deduplicate)
-            TimelineView(.animation(minimumInterval: thermal.danmakuFrameInterval, paused: !clock.playing)) { ctx in
-                let t = clock.now(ctx.date)
-                // 只把此刻在屏幕上的那几条交给 Canvas：整条视频的弹幕可能有几百条，
-                // 以前每一帧都要把全部条目当作 symbol 过一遍 diff。
-                let visible = placed.filter { t >= $0.d.offset && t <= $0.d.offset + $0.dur }
-                Canvas(rendersAsynchronously: false) { gc, _ in
-                    var regionContext = gc
-                    regionContext.clip(to: Path(CGRect(x: 0, y: region.top, width: w, height: max(0, region.bottom - region.top))))
-                    for p in visible {
-                        let x = w - CGFloat(t - p.d.offset) * speed
-                        let y = region.top + CGFloat(p.lane) * DYDanmakuPolicy.laneHeight
-                        guard let sym = regionContext.resolveSymbol(id: p.d.id) else { continue }
-                        regionContext.draw(sym, at: CGPoint(x: x, y: y), anchor: .topLeading)
-                    }
-                } symbols: {
-                    // 只排版一次，逐帧移动贴图；区域外再裁剪，避免遮挡下方内容。
-                    ForEach(visible, id: \.d.id) { p in
-                        Text(p.d.text)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .shadow(color: .black.opacity(0.7), radius: 1.5, y: 1)
-                            .lineLimit(1)
-                            .fixedSize()
-                            .tag(p.d.id)
-                    }
-                }
-            }
-            .frame(width: w, height: g.size.height)
+            DYDanmakuLayerView(placed: placed, top: region.top, bottom: region.bottom,
+                               width: w, speed: speed, clock: clock)
+                .frame(width: w, height: g.size.height)
         }
         .allowsHitTesting(false)
+    }
+}
+
+private struct DYDanmakuLayerView: UIViewRepresentable {
+    let placed: [DYDanmakuPolicy.Placed]
+    let top: CGFloat
+    let bottom: CGFloat
+    let width: CGFloat
+    let speed: CGFloat
+    let clock: DYDanmakuClock
+
+    func makeUIView(context: Context) -> DYDanmakuHostView { DYDanmakuHostView() }
+    func updateUIView(_ view: DYDanmakuHostView, context: Context) {
+        view.update(placed: placed, top: top, bottom: bottom, width: width, speed: speed, clock: clock)
+    }
+    static func dismantleUIView(_ view: DYDanmakuHostView, coordinator: ()) { view.clearAll() }
+}
+
+/// 弹幕位置模型与原实现一致：x(t) = 宽 - (t - 出现时间) × 速度，第 lane 道 y = lane × 行高；
+/// 每条 dur = (宽 + 文字宽) / 速度（视频秒），倍速时墙钟时长 = 视频秒 / 倍速。
+private final class DYDanmakuHostView: UIView {
+    private struct Key: Equatable {
+        let count: Int; let first: String?; let last: String?
+        let width: CGFloat; let speed: CGFloat; let top: CGFloat
+    }
+    /// 弹幕区域：裁剪到区域内，暂停 / 继续整体控制这一层的时间
+    private let lane = CALayer()
+    private var live: [String: (layer: CALayer, end: Double)] = [:]
+    private var images: [String: (image: CGImage, size: CGSize)] = [:]
+    private var key: Key?
+    private var lastT: Double = 0
+    private var lastWall: CFTimeInterval = 0
+    private var lastRate: Double = 1
+    private var lastPlaying = false
+    private var paused = false
+    private static let pad: CGFloat = 4
+    /// 提前多久把即将出现的弹幕挂上（带延迟的动画），要大于时钟同步间隔 0.25 秒
+    private static let lookahead: Double = 0.6
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        lane.masksToBounds = true
+        layer.addSublayer(lane)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(placed: [DYDanmakuPolicy.Placed], top: CGFloat, bottom: CGFloat,
+                width: CGFloat, speed: CGFloat, clock: DYDanmakuClock) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        lane.frame = CGRect(x: 0, y: top, width: width, height: max(0, bottom - top))
+
+        let now = CACurrentMediaTime()
+        let t = clock.now(Date())
+        let rate = max(clock.rate, 0.01)
+        let next = Key(count: placed.count, first: placed.first?.d.id, last: placed.last?.d.id,
+                       width: width, speed: speed, top: top)
+        // 弹幕列表 / 尺寸变了、拖动进度、改倍速：在飞的全部按新时间重排
+        let predicted = lastPlaying ? lastT + (now - lastWall) * lastRate : lastT
+        if next != key || rate != lastRate || abs(t - predicted) > 0.5 {
+            clearAll()
+            key = next
+        }
+        lastT = t; lastWall = now; lastRate = rate; lastPlaying = clock.playing
+
+        guard clock.playing else { pause(); return }
+        resume()
+        for (id, item) in live where item.end <= t {
+            item.layer.removeFromSuperlayer()
+            live[id] = nil
+        }
+        guard width > 0, speed > 0 else { return }
+        for p in placed where p.d.offset <= t + Self.lookahead && p.d.offset + p.dur > t && live[p.d.id] == nil {
+            spawn(p, t: t, now: now, rate: rate, width: width, speed: speed)
+        }
+        if images.count > 400 { images = images.filter { live[$0.key] != nil } }
+    }
+
+    private func spawn(_ p: DYDanmakuPolicy.Placed, t: Double, now: CFTimeInterval, rate: Double,
+                       width: CGFloat, speed: CGFloat) {
+        guard let (image, size) = image(for: p) else { return }
+        let start = max(t, p.d.offset)
+        let x0 = width - CGFloat(start - p.d.offset) * speed - Self.pad
+        let x1 = width - CGFloat(p.dur) * speed - Self.pad
+        let y = CGFloat(p.lane) * DYDanmakuPolicy.laneHeight - Self.pad
+        let l = CALayer()
+        l.contents = image
+        l.contentsScale = image.width > 0 ? CGFloat(image.width) / max(size.width, 1) : traitCollection.displayScale
+        l.anchorPoint = .zero
+        l.bounds = CGRect(origin: .zero, size: size)
+        l.position = CGPoint(x: x1, y: y)          // 模型值是终点（屏幕左外侧），动画结束自然消失
+        let a = CABasicAnimation(keyPath: "position.x")
+        a.fromValue = x0
+        a.toValue = x1
+        a.duration = max(0.01, (p.d.offset + p.dur - start) / rate)
+        a.beginTime = lane.convertTime(now, from: nil) + (start - t) / rate
+        a.fillMode = .backwards                    // 等待出场期间停在右侧屏幕外
+        a.timingFunction = CAMediaTimingFunction(name: .linear)
+        l.add(a, forKey: "move")
+        lane.addSublayer(l)
+        live[p.d.id] = (l, p.d.offset + p.dur)
+    }
+
+    /// 和原来的 SwiftUI 文字同款：15pt 半粗、白色 92%、黑色 70% 阴影（半径 1.5、下移 1），单行
+    private func image(for p: DYDanmakuPolicy.Placed) -> (CGImage, CGSize)? {
+        if let hit = images[p.d.id] { return (hit.image, hit.size) }
+        let shadow = NSShadow()
+        shadow.shadowColor = UIColor.black.withAlphaComponent(0.7)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = CGSize(width: 0, height: 1)
+        let text = NSAttributedString(string: p.d.text.replacingOccurrences(of: "\n", with: " "), attributes: [
+            .font: UIFont.systemFont(ofSize: 15, weight: .semibold),
+            .foregroundColor: UIColor.white.withAlphaComponent(0.92),
+            .shadow: shadow,
+        ])
+        let textSize = text.size()
+        guard textSize.width > 0 else { return nil }
+        let size = CGSize(width: ceil(textSize.width) + Self.pad * 2, height: ceil(textSize.height) + Self.pad * 2)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = window?.screen.scale ?? traitCollection.displayScale
+        format.opaque = false
+        let rendered = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            text.draw(at: CGPoint(x: Self.pad, y: Self.pad))
+        }
+        guard let cg = rendered.cgImage else { return nil }
+        images[p.d.id] = (cg, size)
+        return (cg, size)
+    }
+
+    private func pause() {
+        guard !paused else { return }
+        let t = lane.convertTime(CACurrentMediaTime(), from: nil)
+        lane.speed = 0
+        lane.timeOffset = t
+        paused = true
+    }
+
+    private func resume() {
+        guard paused else { return }
+        let pausedAt = lane.timeOffset
+        lane.speed = 1
+        lane.timeOffset = 0
+        lane.beginTime = 0
+        lane.beginTime = lane.convertTime(CACurrentMediaTime(), from: nil) - pausedAt
+        paused = false
+    }
+
+    func clearAll() {
+        for item in live.values { item.layer.removeFromSuperlayer() }
+        live.removeAll()
     }
 }
 
@@ -817,6 +985,7 @@ struct DYListPlayer: View {
     @State private var currentID: String?
     let loadMore: (() async -> [DYAweme])?
     let onAuthor: (DYAweme) -> Void
+    @Environment(\.horizontalSizeClass) private var hSize
     @Environment(\.dismiss) private var dismiss
     @State private var preloader = DYPreloader()
     @State private var resume: [String: Double] = [:]
@@ -825,12 +994,27 @@ struct DYListPlayer: View {
     @State private var showComments = false
     @State private var toast: String?
     @State private var loadingMore = false
+    /// 从消息点评论进来：自动开评论区并定位那条评论
+    let commentFocus: DYCommentFocus?
 
     init(bridge: DouyinBridge, title: String, items: [DYAweme], start: Int,
-         loadMore: (() async -> [DYAweme])? = nil, onAuthor: @escaping (DYAweme) -> Void) {
+         loadMore: (() async -> [DYAweme])? = nil, startPosition: Double? = nil, previewPlayer: AVPlayer? = nil, onAuthor: @escaping (DYAweme) -> Void,
+         commentFocus: DYCommentFocus? = nil) {
         self.bridge = bridge; self.title = title
+        self.commentFocus = commentFocus
+        _showComments = State(initialValue: commentFocus != nil)
         _items = State(initialValue: items)
-        _currentID = State(initialValue: items.indices.contains(start) ? items[start].id : items.first?.id)
+        let initialID = items.indices.contains(start) ? items[start].id : items.first?.id
+        _currentID = State(initialValue: initialID)
+        if let id = initialID,
+           let startPosition, startPosition.isFinite, startPosition > 0 {
+            _resume = State(initialValue: [id: startPosition])
+        }
+        if let id = initialID, let previewPlayer {
+            let preloader = DYPreloader()
+            preloader.handoff = (id, previewPlayer)
+            _preloader = State(initialValue: preloader)
+        }
         self.loadMore = loadMore; self.onAuthor = onAuthor
         var l = Set<String>(), c = Set<String>()
         for a in items { if a.userDigged == 1 { l.insert(a.id) }; if a.isCollect == 1 { c.insert(a.id) } }
@@ -843,6 +1027,10 @@ struct DYListPlayer: View {
         GeometryReader { geo in
             let layout = DYCommentLayout(size: geo.size, fold: DYDuoMetrics.foldIsActive(geo),
                                          showComments: showComments)
+            let hidesStatus = hSize == .regular && showComments && layout.sideBySide && current != nil
+            let viewport = layout.sideBySide ? geo.size : CGSize(width: layout.videoWidth, height: layout.videoHeight)
+            let scale = min(layout.videoWidth / max(viewport.width, 1),
+                            layout.videoHeight / max(viewport.height, 1))
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
                 // 外屏：评论面板从底部升起，视频缩到上方继续播
@@ -861,7 +1049,7 @@ struct DYListPlayer: View {
                                         bridge: bridge, onToast: { show($0) }, onBack: { dismiss() },
                                         onSwipeLeftOverride: { dismiss() },
                                         onSwipeRightOverride: showComments ? { withAnimation(.snappy) { showComments = false } } : nil)
-                                .frame(width: layout.videoWidth, height: layout.videoHeight)
+                                .frame(width: viewport.width, height: viewport.height)
                                 .clipped()
                                 .id(item.id)
                         }
@@ -872,11 +1060,13 @@ struct DYListPlayer: View {
                 .scrollPosition(id: $currentID, anchor: .top)
                 .defaultScrollAnchor(.top)
                 .scrollIndicators(.hidden)
-                .frame(width: layout.videoWidth, height: layout.videoHeight, alignment: .topLeading)
+                .frame(width: viewport.width, height: viewport.height)
+                .scaleEffect(scale)
+                .frame(width: layout.videoWidth, height: layout.videoHeight)
                 .clipped()
                 } panel: {
                     if let cur = current {
-                        DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
+                        DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } }, focus: commentFocus)
                             .id(cur.id)
                     }
                 }
@@ -884,12 +1074,14 @@ struct DYListPlayer: View {
 
                 if layout.showPanel, let cur = current {
                     DYCommentPanel(bridge: bridge, aweme: cur,
-                                   onClose: layout.fold ? nil : { withAnimation(.snappy) { showComments = false } })
+                                   onClose: layout.fold ? nil : { withAnimation(.snappy) { showComments = false } },
+                                   focus: commentFocus)
                         .frame(width: layout.sideBySide ? layout.panelWidth : geo.size.width,
                                height: layout.tableFold ? layout.panelHeight : geo.size.height)
                         .offset(x: layout.sideBySide ? layout.videoWidth : 0,
                                 y: layout.tableFold ? layout.videoHeight : 0)
                         .id(cur.id)
+                        .transition(layout.sideBySide && !layout.fold ? .opacity : .identity)
                 }
 
                 if let t = toast {
@@ -901,6 +1093,8 @@ struct DYListPlayer: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .statusBarHidden(hidesStatus)
+            .persistentSystemOverlays(hidesStatus ? .hidden : .automatic)
             .animation(layout.docked ? nil : .snappy, value: showComments)
             .animation(.snappy, value: layout.fold)
         }
@@ -1036,6 +1230,8 @@ struct DYListTarget: Identifiable {
     let items: [DYAweme]
     let start: Int
     let model: DYPagedModel?
+    var startPosition: Double? = nil
+    var previewPlayer: AVPlayer? = nil
 }
 
 // MARK: - 搜索
@@ -1055,39 +1251,57 @@ struct DYSearchScreen: View {
     @FocusState private var focused: Bool
     @AppStorage("douyin_search_history_v1") private var historyRaw = ""
 
+    private var searchInk: Color { model == nil ? .white : .black }
+
     private var history: [String] { historyRaw.split(separator: "\n").map(String.init) }
 
     var body: some View {
+        NavigationStack {
+            content
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("返回", systemImage: "chevron.backward") {
+                            focused = false
+                            dismiss()
+                        }
+                        .accessibilityIdentifier("douyin.search.back")
+                    }
+                }
+                .toolbarColorScheme(model == nil ? .dark : .light, for: .navigationBar)
+                .toolbarBackground(model == nil ? Color.black : Color.white, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button { dismiss() } label: {
-                    Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
-                }
-                .accessibilityIdentifier("douyin.search.back")
                 HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.6))
-                    TextField("", text: $kw, prompt: Text("搜索视频").foregroundStyle(.white.opacity(0.45)))
-                        .foregroundStyle(.white)
+                    Image(systemName: "magnifyingglass").foregroundStyle(searchInk.opacity(0.6))
+                    TextField("", text: $kw, prompt: Text("搜索视频").foregroundStyle(searchInk.opacity(0.45)))
+                        .foregroundStyle(searchInk)
                         .focused($focused)
                         .submitLabel(.search)
                         .onSubmit { run(kw) }
                         .accessibilityIdentifier("douyin.search.field")
                     if !kw.isEmpty {
                         Button { kw = ""; model = nil; focused = true } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.5))
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(searchInk.opacity(0.5))
                         }
                     }
                 }
                 .padding(.horizontal, 12).frame(height: 38)
-                .background(Capsule().fill(.white.opacity(0.12)))
-                Button("搜索") { run(kw) }.foregroundStyle(.white).font(.subheadline.weight(.semibold))
+                .background(Capsule().fill(searchInk.opacity(0.06)))
+                Button("搜索") { run(kw) }.foregroundStyle(searchInk).font(.subheadline.weight(.semibold))
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
 
             if let model {
-                DYSearchResults(model: model, onOpen: { i in
-                    open = DYListTarget(title: "搜索：\(kw)", items: model.items, start: i, model: model)
+                DYSearchResults(model: model, bridge: bridge, query: lastRun, allowsAutoplay: open == nil, onSearch: run, onOpen: { i, position, player in
+                    open = DYListTarget(title: "搜索：\(kw)", items: model.items, start: i, model: model, startPosition: position, previewPlayer: player)
                 })
+                .id(ObjectIdentifier(model))
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1121,7 +1335,9 @@ struct DYSearchScreen: View {
                 }
             }
         }
-        .background(Color.black.ignoresSafeArea())
+        // Keep scroll content inside the search viewport while the background fills the system rail.
+        .clipped()
+        .background((model == nil ? Color.black : Color.white).ignoresSafeArea())
         .background(DYSwipeDismiss(enabled: open == nil) {
             focused = false
             dismiss()
@@ -1150,7 +1366,7 @@ struct DYSearchScreen: View {
         }
         .fullScreenCover(item: $open) { t in
             DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
-                         loadMore: t.model.map { m in { await m.loadMore() } }, onAuthor: onAuthor)
+                         loadMore: t.model.map { m in { await m.loadMore() } }, startPosition: t.startPosition, previewPlayer: t.previewPlayer, onAuthor: onAuthor)
         }
     }
 
@@ -1205,10 +1421,255 @@ struct DYSearchScreen: View {
 
 private struct DYSearchResults: View {
     @ObservedObject var model: DYPagedModel
-    let onOpen: (Int) -> Void
+    let bridge: DouyinBridge
+    let query: String
+    let allowsAutoplay: Bool
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var visibleID: String?
+    let onSearch: (String) -> Void
+    let onOpen: (Int, Double?, AVPlayer?) -> Void
+    @State private var activePreview: (id: String, player: AVPlayer)?
+    @State private var showsGrid = false
+    @State private var related: [String] = []
+    private let surface = Color(white: 0.96)
+
     var body: some View {
-        DYGrid(items: model.items, hasMore: model.hasMore, loading: model.loading, error: model.error,
-               onLoadMore: { Task { await model.loadMore() } }, onOpen: onOpen)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 28) {
+                tab("综合", grid: false)
+                tab("视频", grid: true)
+            }
+            .padding(.horizontal, 16)
+            if showsGrid {
+                DYGrid(items: model.items, hasMore: model.hasMore, loading: model.loading, error: model.error,
+                       onLoadMore: loadMore, onOpen: { onOpen($0, nil, nil) })
+                    .background(Color.black)
+            } else {
+                if !related.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(related, id: \.self) { term in
+                                Button(term) { onSearch(term) }
+                                    .buttonStyle(.plain)
+                                    .font(.footnote)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(surface, in: RoundedRectangle(cornerRadius: 4))
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                    }
+                    .scrollIndicators(.hidden)
+                    .clipped()
+                }
+                cards
+            }
+        }
+        .foregroundStyle(.black)
+        .task {
+            let suggestions = await bridge.suggest(query)
+            guard !Task.isCancelled else { return }
+            var seen: Set<String> = [query, ""]
+            related = suggestions.map(\.word).filter { seen.insert($0).inserted }
+        }
+    }
+
+    private func tab(_ title: String, grid: Bool) -> some View {
+        let selected = showsGrid == grid
+        return Button { showsGrid = grid } label: {
+            VStack(spacing: 6) {
+                Text(title).font(.subheadline.weight(selected ? .bold : .medium))
+                    .foregroundStyle(selected ? Color.black : Color(white: 0.38))
+                Capsule().fill(selected ? Color.black : Color.clear).frame(width: 14, height: 2)
+            }
+            .frame(minHeight: 40)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var cards: some View {
+        GeometryReader { outer in
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
+                        Button {
+                            let preview = activePreview.flatMap { $0.id == item.id ? $0.player : nil }
+                            let position = preview?.currentTime().seconds
+                            activePreview?.player.pause()
+                            let readyPreview = preview?.currentItem?.status == .readyToPlay ? preview : nil
+                            if readyPreview != nil { activePreview = nil }
+                            onOpen(index, position, readyPreview)
+                        } label: {
+                            DYSearchResultCard(item: item, autoplays: allowsAutoplay && scenePhase == .active
+                                               && item.id == (visibleID ?? model.items.first?.id),
+                                               onPreviewChange: { player, isPlaying in
+                                if isPlaying {
+                                    activePreview?.player.pause()
+                                    activePreview = (item.id, player)
+                                } else if activePreview?.player === player {
+                                    player.pause()
+                                    activePreview = nil
+                                }
+                            })
+                        }
+                        .buttonStyle(.plain)
+                        .id(item.id)
+                    }
+                }
+                .scrollTargetLayout()
+
+                VStack(spacing: 0) {
+                    if model.loading {
+                        ProgressView().padding(20)
+                    } else if let error = model.error {
+                        VStack(spacing: 8) {
+                            Text(error).multilineTextAlignment(.center)
+                            Button("重试", action: loadMore)
+                        }
+                        .font(.footnote)
+                        .padding(20)
+                    } else if model.items.isEmpty {
+                        Text("没有找到相关内容").font(.footnote).padding(24)
+                    } else if model.hasMore {
+                        GeometryReader { geometry in
+                            Color.clear.preference(key: DYBottomYKey.self,
+                                                   value: geometry.frame(in: .named("searchCards")).minY)
+                        }
+                        .frame(height: 40)
+                    }
+                }
+            }
+            .contentMargins(.vertical, 10)
+            .scrollPosition(id: $visibleID, anchor: .top)
+            .frame(maxWidth: 720)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .coordinateSpace(name: "searchCards")
+            .onPreferenceChange(DYBottomYKey.self) { y in
+                if y < outer.size.height - 16 { loadMore() }
+            }
+        }
+        .background(surface)
+    }
+
+    private func loadMore() {
+        Task { await model.loadMore() }
+    }
+}
+
+private struct DYSearchResultCard: View {
+    let item: DYAweme
+    let autoplays: Bool
+    let onPreviewChange: (AVPlayer, Bool) -> Void
+
+    private var authorName: String {
+        let name = item.author.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return "未知作者" }
+        return name.hasPrefix("@") ? name : "@" + name
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                CachedAsyncImage(url: item.author.avatar.flatMap(URL.init(string:))) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.gray)
+                }
+                .frame(width: 36, height: 36)
+                .clipShape(Circle())
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(authorName).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    if let metadata = item.metadataText() {
+                        Text(metadata).font(.caption).foregroundStyle(Color(white: 0.38))
+                    }
+                }
+            }
+            if !item.desc.isEmpty {
+                Text(item.desc).font(.subheadline).lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            media
+            HStack(spacing: 4) {
+                count("点赞", icon: "heart", value: item.stats.digg)
+                count("评论", icon: "bubble", value: item.stats.comment)
+                count("收藏", icon: "star", value: item.stats.collect)
+                count("分享", icon: "arrowshape.turn.up.right", value: item.stats.share)
+            }
+            .frame(maxWidth: 420)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white, in: RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+    }
+
+    private var media: some View {
+        let url = (item.cover ?? item.images.first).flatMap(URL.init(string:))
+        return Color(white: 0.92)
+            .aspectRatio(item.isTallFrame ? 3.0 / 4 : 16.0 / 9, contentMode: .fit)
+            .overlay {
+                CachedAsyncImage(url: url) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: { Color.clear }
+            }
+            .overlay {
+                if autoplays, item.images.isEmpty, let url = item.play.flatMap(URL.init(string:)) {
+                    DYSearchInlinePreview(url: url, onPlayerChange: onPreviewChange)
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !item.images.isEmpty {
+                    Label("图集", systemImage: "photo.on.rectangle")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .foregroundStyle(.white)
+                        .background(.black.opacity(0.7), in: Capsule())
+                        .padding(8)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .frame(maxWidth: item.isTallFrame ? 240 : 420)
+            .accessibilityHidden(true)
+    }
+
+    private func count(_ title: String, icon: String, value: Int) -> some View {
+        Label(DYFormat.count(value), systemImage: icon)
+            .font(.caption)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("\(title) \(value)")
+    }
+}
+
+private struct DYSearchInlinePreview: View {
+    let url: URL
+    let onPlayerChange: (AVPlayer, Bool) -> Void
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .task(id: url) {
+                player?.pause()
+                let preview = AVPlayer(playerItem: AVPlayerItem(asset: DYMedia.asset(url)))
+                let audioSession = AVAudioSession.sharedInstance()
+                try? audioSession.setCategory(.playback, mode: .moviePlayback)
+                try? audioSession.setActive(true)
+                player = preview
+                onPlayerChange(preview, true)
+                preview.play()
+            }
+            .onDisappear {
+                guard let player else { return }
+                onPlayerChange(player, false)
+                self.player = nil
+            }
     }
 }
 

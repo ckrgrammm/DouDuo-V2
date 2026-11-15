@@ -2,11 +2,11 @@ import SwiftUI
 import UIKit
 import AVFoundation
 
-/// 后台/失焦立刻停声：用 AppDelegate 回调，比 SwiftUI 的 scenePhase 稳
-/// （实测 Scene 上的 onChange 在部分切后台路径下不触发，声音就漏出去了）
+/// 前后台过渡用 AppDelegate。Scene 的 onChange 在部分切后台路径下不触发。
+/// 短视频仍在这里暂停。直播继续或静音由「后台直播声音」在同一条生命周期里决定。
 final class DouDuoAppDelegate: NSObject, UIApplicationDelegate {
     func applicationWillResignActive(_ application: UIApplication) {
-        DDPlayback.shared.pauseAll()
+        DDPlayback.shared.pauseForInactivity()
     }
     func applicationDidEnterBackground(_ application: UIApplication) {
         DDPlayback.shared.pauseAll()
@@ -21,6 +21,11 @@ final class DouDuoAppDelegate: NSObject, UIApplicationDelegate {
     #endif
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        _ = DDThermal.shared   // 启动即开始记录温度档（DDTHERMAL）
+        #if DEBUG
+        // 自动测试用：DOUDUO_CHROME_MODE=classic|rail|minimal 启动时写入界面模式（不用 -key 启动参数，那会盖住运行时修改）
+        if let m = ProcessInfo.processInfo.environment["DOUDUO_CHROME_MODE"] { UserDefaults.standard.set(m, forKey: "douyin_chrome_mode_v1") }
+        #endif
         #if DEBUG
         // 自动测试用：DOUDUO_ACTTEST=<aweme_id> → 起播后直接打点赞/收藏接口，结果写 ddlog
         if let aid = ProcessInfo.processInfo.environment["DOUDUO_ACTTEST"] {
@@ -98,14 +103,23 @@ struct DouDuoApp: App {
                 .preferredColorScheme(.dark)
             #endif
         }
-        // 退到后台 / 锁屏 / 来电：立刻停掉所有播放器的声音（不做后台播放）
+        // 退到后台 / 锁屏：短视频按「后台播放」停声。直播走同一条恢复，是否出声看「后台直播声音」。
+        // 回到前台会先经过 inactive。这里如果当成后台，会把刚刚恢复的直播立刻停掉。
         .onChange(of: scenePhase) { _, phase in
             #if DEBUG
             LocalVideoLaunch.log("DDSCENE phase=\(String(describing: phase))")
             #endif
+            let signal: DYLiveSceneSignal
             switch phase {
-            case .active: DDPlayback.shared.resumeAll()
-            default: DDPlayback.shared.pauseAll()
+            case .active: signal = .active
+            case .background: signal = .background
+            case .inactive: signal = .inactive
+            @unknown default: signal = .inactive
+            }
+            switch DYLivePlaybackGate.sceneCommand(signal) {
+            case .pause: DDPlayback.shared.pauseAll()
+            case .resume: DDPlayback.shared.resumeAll()
+            case .none: break
             }
         }
     }

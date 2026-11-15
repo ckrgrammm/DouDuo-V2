@@ -121,8 +121,8 @@ struct DYSharedVideoPool<Item: DYFeedItem>: Sendable {
 
     /// 重排：把播放列表里还没播的退回池子最前（它们早已 known，不重复计数）
     mutating func putBack(_ items: [Item]) {
-        let have = Set(candidates.map(\.id))
-        candidates.insert(contentsOf: items.filter { !have.contains($0.id) }, at: 0)
+        var have = Set(candidates.map(\.id))
+        candidates.insert(contentsOf: items.filter { have.insert($0.id).inserted }, at: 0)
         known.formUnion(items.map(\.id))
         mixCredit = 0
         trim()
@@ -156,8 +156,8 @@ struct DYSharedVideoPool<Item: DYFeedItem>: Sendable {
         return candidates
     }
     mutating func restore(_ backup: [Item]) {
-        let have = Set(candidates.map(\.id))
-        candidates = backup.filter { !have.contains($0.id) } + candidates
+        var have = Set(candidates.map(\.id))
+        candidates = backup.filter { have.insert($0.id).inserted } + candidates
         trim()
     }
 

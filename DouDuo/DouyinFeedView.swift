@@ -186,6 +186,10 @@ struct DYComment: Identifiable, Decodable, Equatable {
     /// 评论配图（image_list）与表情包贴纸（sticker），缺字段为空
     var images: [DYCommentImage]? = nil
     var sticker: DYCommentImage? = nil
+    /// 定位评论时接口随一级评论一起带回的楼中楼（只在 insert_ids 请求里有）
+    var pinned: [DYComment]? = nil
+    /// 楼中楼被 insert_ids 直接顶到一级列表时，它所属的一级评论 cid（回复它要用）
+    var parent: String? = nil
 }
 
 /// 评论里的一张图：缩略图用于列表，原图用于点开全屏
@@ -216,7 +220,40 @@ struct DYLiveRoom: Identifiable, Decodable, Equatable {
     var webURL: URL { URL(string: "https://live.douyin.com/\(webRid)")! }
 }
 
+extension DYLiveRoom {
+    var followMetadata: DYFollowMetadata {
+        DYFollowMetadata(id: id, webRid: webRid, title: title, owner: owner, avatar: avatar, cover: cover, viewers: viewers, portrait: portrait)
+    }
+
+    init(_ metadata: DYFollowMetadata) {
+        self.init(id: metadata.id, webRid: metadata.webRid, title: metadata.title, owner: metadata.owner,
+                  avatar: metadata.avatar, cover: metadata.cover, viewers: metadata.viewers, hls: [:], portrait: metadata.portrait)
+    }
+
+    init(playback resolved: DYLiveRoom, fallback: DYLiveRoom) {
+        let meta = resolved.followMetadata.fillingEmpty(from: fallback.followMetadata)
+        self.init(id: meta.id, webRid: meta.webRid, title: meta.title, owner: meta.owner, avatar: meta.avatar,
+                  cover: meta.cover, viewers: meta.viewers, hls: resolved.hls, flv: resolved.flv, portrait: meta.portrait, def: resolved.def)
+    }
+}
+
 private struct DYLiveResp: Decodable { let status: Int; let items: [DYLiveRoom] }
+
+struct DYFollowLiveResult: Equatable {
+    var kind: DYFollowLiveKind
+    var items: [DYLiveRoom]
+    var status: Int
+    var stats: DYFollowLiveStats?
+    var fromCache = false
+    var stale = false
+}
+
+private struct DYFollowLivePayload: Decodable {
+    let status: Int
+    let items: [DYLiveRoom]
+    let stats: DYFollowLiveStats?
+}
+
 
 /// 直播专区（网页版「游戏」下的专区；id 取自 live.douyin.com/categorynew/4_103_1_<id>）
 /// shortcut: 写死网页版游戏页上的几个专区，网页改版/要别的分类时再从页面里抓
@@ -247,6 +284,8 @@ enum DYError: LocalizedError {
 @MainActor
 final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     @Published private(set) var ready = false
+    /// 只在 `reload` 推进。界面用它清掉上一账号的关注直播，不代表登录态本身。
+    @Published private(set) var followSession = 0
     let web: WKWebView
     private let readCache = DYAsyncReadCache()
     private var readyWaiters: [CheckedContinuation<Void, Never>] = []
@@ -276,6 +315,8 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     func reload() {
+        followSessionCache.invalidate()
+        followSession = followSessionCache.generation
         invalidateReadCache()
         selfSecCache = nil
         ready = false
@@ -713,13 +754,14 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         return s.contains("sessionid") || s == "1"
     }
 
-    func fetchComments(_ id: String, cursor: Int) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool, total: Int) {
+    /// insert：要「插到最前」的评论 cid（逗号分隔，一级评论在前、楼中楼在后）。从消息点评论跳视频时用来定位。
+    func fetchComments(_ id: String, cursor: Int, insert: String? = nil) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool, total: Int) {
         for attempt in 0..<3 {
             try Task.checkCancellation()
             let page: DYCommentPage
             do {
                 // 首屏评论已在视频轮到时预取：缓存 5 分钟，看完长视频再点评论也是秒开；翻页仍 30 秒
-                let data = try await cachedRead(Self.commentJS, args: ["id": id, "cursor": String(cursor)],
+                let data = try await cachedRead(Self.commentJS, args: ["id": id, "cursor": String(cursor), "ins": insert ?? ""],
                                                 maxAge: cursor == 0 ? 300 : 30)
                 page = try JSONDecoder().decode(DYCommentPage.self, from: data)
             } catch {
@@ -750,13 +792,145 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     private var liveOffset = 0
     private var liveCursorGeneration = UUID()
 
-    /// 关注的主播里正在直播的（网页版直播首页顶上那排头像，同一个接口；要登录）
+    /// 关注的主播里正在直播的。列表只带展示信息；播放地址等选中单个主播再解析。
     func fetchFollowLive() async throws -> [DYLiveRoom] {
-        let d = try await call(Self.followLiveJS, args: [:], attempts: 2)
-        let p = try JSONDecoder().decode(DYLiveResp.self, from: d)
-        if p.items.isEmpty { DYLiveModel.log("DDFOLLOWLIVE status=\(p.status) raw=\(String(decoding: d.prefix(300), as: UTF8.self))") }
-        guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }
-        return p.items
+        let result = await followLiveResult()
+        switch result.kind {
+        case .rooms:
+            return result.items
+        case .nobodyLive, .filtered:
+            return []
+        case .notLoggedIn:
+            throw DYError.blocked("HTTP 401")
+        case .decodeFailed, .unexpectedShape:
+            throw DYError.bad("直播数据无法解析")
+        case .requestFailed:
+            throw DYError.blocked(result.status == 200 ? "连接失败" : "HTTP \(result.status)")
+        }
+    }
+
+    /// 同一次关注直播请求的分类结果。空列表不会一律当成没人直播。
+    /// `ignoreCache` 用于手动刷新。15 秒内的缓存只有主播信息，没有播放地址。
+    func followLiveResult(ignoreCache: Bool = false) async -> DYFollowLiveResult {
+        let generation = followSessionCache.generation
+        if !ignoreCache, let cached = followSessionCache.cachedItems(now: Date()) {
+            let rooms = DYFollowLiveIdentity.unique(cached.map { DYLiveRoom($0) }, id: \.id, webRid: \.webRid)
+            DYLiveModel.log("DDFOLLOWLIVE outcome=rooms source=cache n=\(rooms.count) listRequests=0 detailRequests=0")
+            return DYFollowLiveResult(kind: .rooms, items: rooms, status: 200, stats: nil, fromCache: true)
+        }
+        let joining = followSessionCache.beginList(generation: generation)
+        let epoch = followSessionCache.listEpoch
+        if joining, let followLiveTask {
+            let result = await followLiveTask.value
+            return scopedFollowResult(result, generation: generation, epoch: epoch)
+        }
+        followLiveTicket += 1
+        let ticket = followLiveTicket
+        let task = Task { await self.performFollowLive(generation: generation, epoch: epoch) }
+        followLiveTask = task
+        let result = await task.value
+        if followLiveTicket == ticket {
+            followLiveTask = nil
+            followSessionCache.finishList(generation: generation)
+        }
+        return scopedFollowResult(result, generation: generation, epoch: epoch)
+    }
+
+    /// 只解析当前这一间。已有可播地址时不再请求。同一个 webRid、同一代际的进行中请求会合并。
+    func resolveFollowRoom(webRid: String) async -> DYFollowLiveResult {
+        let generation = followSessionCache.generation
+        let epoch = followSessionCache.listEpoch
+        let result: DYFollowLiveResult
+        if followSessionCache.beginRoom(webRid: webRid), let current = followRoomTask, current.rid == webRid {
+            result = await current.task.value
+        } else {
+            followRoomTicket += 1
+            let ticket = followRoomTicket
+            let task = Task { await self.performFollowRoom(webRid) }
+            followRoomTask = (webRid, ticket, task)
+            result = await task.value
+            if followRoomTask?.ticket == ticket {
+                followRoomTask = nil
+                followSessionCache.finishRoom(webRid: webRid, generation: generation)
+            }
+        }
+        if result.kind == .notLoggedIn {
+            followSessionCache.noteNotLoggedIn(generation: generation, epoch: epoch)
+        }
+        return scopedFollowResult(result, generation: generation, epoch: epoch)
+    }
+
+    private var followLiveTask: Task<DYFollowLiveResult, Never>?
+    private var followLiveTicket = 0
+    private var followSessionCache = DYFollowSessionCache(ttl: 15)
+    private var followRoomTask: (rid: String, ticket: Int, task: Task<DYFollowLiveResult, Never>)?
+    private var followRoomTicket = 0
+
+    private func scopedFollowResult(_ result: DYFollowLiveResult, generation: Int, epoch: Int) -> DYFollowLiveResult {
+        if result.kind == .notLoggedIn, followSessionCache.generation == generation, followSessionCache.listEpoch == epoch {
+            var visible = result
+            visible.items = []
+            visible.stale = false
+            return visible
+        }
+        guard followSessionCache.accepts(generation: generation, epoch: epoch) else {
+            var hidden = result
+            hidden.items = []
+            hidden.stale = true
+            return hidden
+        }
+        return result
+    }
+
+    private func performFollowLive(generation: Int, epoch: Int) async -> DYFollowLiveResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        let data: Data
+        do { data = try await call(DYFollowLiveScripts.list, args: [:], attempts: 2) }
+        catch {
+            DYLiveModel.log("DDFOLLOWLIVE outcome=request_failed listRequests=1 detailRequests=0 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: .requestFailed, items: [], status: -1, stats: nil)
+        }
+        do {
+            let page = try JSONDecoder().decode(DYFollowLivePayload.self, from: data)
+            let items = DYFollowLiveIdentity.unique(page.items, id: \.id, webRid: \.webRid)
+            let kind = DYFollowLiveClassify.kind(status: page.status, itemCount: items.count, stats: page.stats)
+            let stats = page.stats
+            if kind == .rooms, !items.isEmpty {
+                followSessionCache.store(items: items.map(\.followMetadata), generation: generation, epoch: epoch, now: Date())
+            } else if kind == .notLoggedIn {
+                followSessionCache.noteNotLoggedIn(generation: generation, epoch: epoch)
+            }
+            DYLiveModel.log("DDFOLLOWLIVE outcome=\(kind.rawValue) status=\(page.status) http=\(stats?.http ?? -1) code=\(stats?.code.map(String.init) ?? "-") list=\(stats?.list ?? -1) kept=\(items.count) dropped=\(stats?.dropped ?? -1) listRequests=1 detailRequests=0 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: kind, items: kind == .rooms ? items : [], status: page.status, stats: stats)
+        } catch {
+            DYLiveModel.log("DDFOLLOWLIVE outcome=decode_failed listRequests=1 detailRequests=0 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: .decodeFailed, items: [], status: -1, stats: nil)
+        }
+    }
+
+    private func performFollowRoom(_ webRid: String) async -> DYFollowLiveResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        let data: Data
+        do { data = try await call(DYFollowLiveScripts.room, args: ["rid": webRid], attempts: 1) }
+        catch {
+            DYLiveModel.log("DDFOLLOWROOM outcome=request_failed detailRequests=1 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: .requestFailed, items: [], status: -1, stats: nil)
+        }
+        do {
+            let page = try JSONDecoder().decode(DYFollowLivePayload.self, from: data)
+            let decoded = DYFollowLiveClassify.kind(status: page.status, itemCount: page.items.count, stats: page.stats)
+            let playable = page.items.filter { !$0.liveStreams.isEmpty }
+            let kind: DYFollowLiveKind = decoded == .rooms && playable.isEmpty ? .filtered : decoded
+            DYLiveModel.log("DDFOLLOWROOM outcome=\(kind.rawValue) status=\(page.status) detailRequests=1 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: kind, items: kind == .rooms ? playable : [], status: page.status, stats: page.stats)
+        } catch {
+            DYLiveModel.log("DDFOLLOWROOM outcome=decode_failed detailRequests=1 elapsed=\(Self.elapsed(since: started))")
+            return DYFollowLiveResult(kind: .decodeFailed, items: [], status: -1, stats: nil)
+        }
+    }
+
+    private static func elapsed(since started: TimeInterval) -> String {
+        String(format: "%.3f", ProcessInfo.processInfo.systemUptime - started)
     }
 
     private static let followLiveJS = #"""
@@ -791,6 +965,37 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     }
     return JSON.stringify({ status: 200, items: out, raw: out.length ? null : (r.t || '').slice(0, 300) });
     """#
+
+    func refreshLivePreview(_ room: DYLiveRoom) async throws -> DYLiveRoom? {
+        guard !room.webRid.isEmpty else { return nil }
+        let script = #"""
+        const r = await req('GET', 'https://live.douyin.com/webcast/room/web/enter/?' + new URLSearchParams({
+          aid: '6383', app_name: 'douyin_web', live_id: '1', device_platform: 'web',
+          enter_from: 'web_live', enter_source: '', web_rid: rid
+        }).toString());
+        const room = parse(r.t)?.data?.data?.[0];
+        const su = room?.stream_url;
+        return JSON.stringify({ hls: room?.status === 2 ? su?.hls_pull_url_map || {} : {},
+          flv: room?.status === 2 && su ? compatibleLiveFLV(su) : {} });
+        """#
+        struct Sources: Decodable {
+            let hls: [String: String]
+            let flv: [String: String]
+        }
+        let data = try await call(script, args: ["rid": room.webRid], attempts: 1)
+        let sources = try JSONDecoder().decode(Sources.self, from: data)
+        guard !sources.hls.isEmpty || !sources.flv.isEmpty else { return nil }
+        return DYLiveRoom(id: room.id, webRid: room.webRid, title: room.title, owner: room.owner,
+                          avatar: room.avatar, cover: room.cover, viewers: room.viewers,
+                          hls: sources.hls, flv: sources.flv, portrait: room.portrait, def: room.def)
+    }
+
+    func fetchRecommendationLive(after cursor: String) async throws -> [DYLiveRoom] {
+        let data = try await call(Self.liveJS, args: ["maxtime": cursor])
+        let page = try JSONDecoder().decode(DYLiveResp.self, from: data)
+        guard page.status == 200 else { throw DYError.blocked("HTTP \(page.status)") }
+        return page.items
+    }
 
     func fetchLive(reset: Bool, zone: DYLiveZone? = nil) async throws -> [DYLiveRoom] {
         if reset { liveMaxTime = "0"; liveOffset = 0; liveCursorGeneration = UUID() }
@@ -1103,6 +1308,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     private static let commentJS = #"""
     const P = Object.assign({}, base, { aweme_id: id, cursor: cursor, count: '20', item_type: '0', whale_cut_token: '', cut_version: '1', rcFT: '' });
+    if (ins) P.insert_ids = ins;
     const r = await req('GET', '/aweme/v1/web/comment/list/?' + new URLSearchParams(P).toString());
     const d = parse(r.t);
     if (!d) return JSON.stringify({ status: r.s, items: [], cursor: 0, hasMore: false, total: 0, msg: 'blocked' });
@@ -1118,11 +1324,14 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       const an = ddImg(s.animate_url) || st;
       return { thumb: st.u, full: an.u, w: s.width || st.w, h: s.height || st.h };
     };
-    const items = (d.comments || []).map(c => ({
+    const one = c => ({
       id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', avatar: c.user && first(c.user.avatar_thumb),
       digg: c.digg_count || 0, time: c.create_time || 0, replies: c.reply_comment_total || 0, ip: c.ip_label || null, userDigged: c.user_digged ? 1 : 0,
-      images: ddImages(c), sticker: ddSticker(c)
-    }));
+      images: ddImages(c), sticker: ddSticker(c),
+      parent: (c.reply_id && String(c.reply_id) !== '0') ? String(c.reply_id) : null
+    });
+    // insert_ids 定位楼中楼时，那条回复挂在一级评论的 reply_comment 里
+    const items = (d.comments || []).map(c => Object.assign(one(c), (ins && c.reply_comment && c.reply_comment.length) ? { pinned: c.reply_comment.map(r => Object.assign(one(r), { replies: 0 })) } : {}));
     return JSON.stringify({ status: r.s, code: d.status_code ?? null, items, cursor: d.cursor || 0, hasMore: !!d.has_more, total: d.total || 0, msg: d.status_msg || null });
     """#
 }
@@ -1176,7 +1385,8 @@ private struct DYPlayerLayerView: UIViewRepresentable {
 /// 封面同时预取。窗口外的立即释放（硬解码会话有限，不能无限开）。
 @MainActor
 final class DYPreloader {
-    static let ahead = 3   // 提前暖 3 条；微热降到 2、烫了 1
+    static let ahead = 2   // 提前暖 2 条（每条都占一个硬解码会话和缓冲带宽）；烫了降到 1
+    var handoff: (id: String, player: AVPlayer)?
     private var players: [String: AVPlayer] = [:]
     private var handedOut: Set<String> = []
     private var obs: [String: NSKeyValueObservation] = [:]
@@ -1189,7 +1399,7 @@ final class DYPreloader {
     func update(_ items: [DYAweme], current index: Int) {
         guard !disabled, items.indices.contains(index) else { return }
         let th = ProcessInfo.processInfo.thermalState
-        let ahead = th == .nominal ? Self.ahead : (th == .fair ? 2 : 1)
+        let ahead = th == .nominal || th == .fair ? Self.ahead : 1
         let lo = index + 1, hi = min(items.count - 1, index + ahead)
         let window = lo <= hi ? Array(items[lo...hi]) : []
         let ids = Set(window.map(\.id))
@@ -1199,7 +1409,8 @@ final class DYPreloader {
         handedOut = handedOut.filter { near.contains($0) || ids.contains($0) }
         for a in window where players[a.id] == nil && !handedOut.contains(a.id) {
             // 图文：每张图都提前下好并在后台按屏幕尺寸解码（翻页时主线程不再解大图），背景音乐跟视频一样提前缓冲
-            if !a.images.isEmpty { DYImagePostView.prefetchImages(a) }
+            // 还没刷到的图文只备前 3 张：整条解码会把正在看的那条的图挤出内存缓存
+            if !a.images.isEmpty { DYImagePostView.prefetchImages(a, limit: 3) }
             let source: URL
             if let music = a.imageMusicURL { source = music }
             else if a.images.isEmpty, let s = a.play, let url = URL(string: s) { source = DYVideoCache.localURL(a.id) ?? url }
@@ -1221,6 +1432,11 @@ final class DYPreloader {
 
     /// 页面起播时来领；领走后由页面负责释放
     func take(_ id: String) -> AVPlayer? {
+        if let handoff, handoff.id == id {
+            self.handoff = nil
+            handedOut.insert(id)
+            return handoff.player
+        }
         guard let p = players.removeValue(forKey: id) else { return nil }
         obs.removeValue(forKey: id)?.invalidate()
         handedOut.insert(id)
@@ -1229,6 +1445,8 @@ final class DYPreloader {
     }
 
     func clear() {
+        handoff?.player.pause()
+        handoff = nil
         for (id, p) in players { release(id, p) }
         handedOut.removeAll()
     }
@@ -1381,8 +1599,9 @@ final class DYFeedModel: ObservableObject {
     func deliver(_ n: Int, substitute: Bool) async -> Int {
         guard n > 0 else { return 0 }
         await pipeline.setRatio(targetRatio)
-        let have = Set(items.map(\.id))
-        let got = await pipeline.take(n, substitute: substitute, ahead: aheadCount).filter { !have.contains($0.id) }
+        let candidates = await pipeline.take(n, substitute: substitute, ahead: aheadCount)
+        var have = Set(items.map(\.id))
+        let got = candidates.filter { have.insert($0.id).inserted }
         guard !got.isEmpty else { return 0 }
         for a in got {
             // 账号里已点赞/已收藏的，进页面就是选中态
@@ -1512,56 +1731,6 @@ final class DYFeedModel: ObservableObject {
     }
 }
 
-private struct DYFoldedRecommendBoundsKey: PreferenceKey {
-    static var defaultValue: Anchor<CGRect>? { nil }
-    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
-        value = nextValue() ?? value
-    }
-}
-
-/// 未取得系统遮挡边界时使用的保守设备布局参数，不是摄像头实测轮廓。
-/// 如增加外屏设备型号，应按该型号校准这组预留值，而不是从 safeAreaInsets 推算镜头形状。
-private struct DYFoldedNavigationProfile {
-    var cameraReservedWidth: CGFloat = 56
-    var cameraReservedHeight: CGFloat = 64
-    var cameraTrailingMargin: CGFloat = 16
-    var cameraGap: CGFloat = 20
-    var edgeMargin: CGFloat = 8
-    var buttonSide: CGFloat = 44
-
-    func fallbackCamera(in size: CGSize, safe: EdgeInsets) -> CGRect {
-        CGRect(x: max(0, size.width - max(cameraTrailingMargin, safe.trailing) - cameraReservedWidth),
-               y: 0, width: cameraReservedWidth, height: max(cameraReservedHeight, safe.top))
-    }
-
-    func searchFrame(size: CGSize, safe: EdgeInsets, camera: CGRect, recommend: CGRect) -> CGRect? {
-        let left = max(edgeMargin, safe.leading)
-        let right = size.width - max(edgeMargin, safe.trailing)
-        let top = max(safe.top, 44) + edgeMargin
-        let bottom = size.height - max(edgeMargin, safe.bottom)
-        guard right - left >= buttonSide, bottom - top >= buttonSide else { return nil }
-        let tabs = CGRect(x: left, y: recommend.minY,
-                          width: max(0, recommend.maxX - left), height: recommend.height)
-        // 优先与右上摄像头组合；只放在确实容得下完整点击区域的一侧。
-        // 垂直方向跟顶栏 Tab 同一行（中心对齐「推荐」），不再按摄像头中心定位——那样会比顶栏低一截。
-        let rowY = recommend.midY - buttonSide / 2
-        for x in [camera.minX - cameraGap - buttonSide, camera.maxX + cameraGap] {
-            let frame = CGRect(x: x, y: rowY, width: buttonSide, height: buttonSide)
-            if frame.minX >= left, frame.maxX <= right, frame.maxY <= bottom,
-               !frame.intersects(tabs.insetBy(dx: -edgeMargin, dy: 0)),
-               !frame.intersects(camera) { return frame }
-        }
-        // 同行与 Tab 冲突时只移动搜索按钮：下一行仍优先保持摄像头旁的 20pt 水平间隔。
-        let sideX = [camera.minX - cameraGap - buttonSide, camera.maxX + cameraGap]
-            .first { $0 >= left && $0 + buttonSide <= right }
-        // 极窄窗口两侧均放不下时，退到摄像头下方的右侧安全区。
-        let frame = CGRect(x: sideX ?? (right - buttonSide),
-                           y: max(top, camera.maxY + edgeMargin, recommend.maxY + edgeMargin),
-                           width: buttonSide, height: buttonSide)
-        return frame.maxY <= bottom ? frame : nil
-    }
-}
-
 private struct DYFeedSafeInsetsKey: EnvironmentKey {
     static let defaultValue = EdgeInsets()
 }
@@ -1590,6 +1759,7 @@ private struct DYFeedMediaBoundary: Shape {
 }
 
 struct DouyinFeedScreen: View {
+    @State private var topChrome = CGRect.zero
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
@@ -1615,6 +1785,20 @@ struct DouyinFeedScreen: View {
         if e["DOUDUO_STARTFOLLOW"] == "1" { return .follow }
         return .recommend
     }()
+    @State private var liveEntryStartedAt: TimeInterval?
+    private var displayedLive: DYLiveModel {
+        enteredLiveFromRecommendations ? recommendationLivePlayer : live
+    }
+
+    @StateObject private var recommendationLivePlayer = DYLiveModel()
+    @State private var enteredLiveFromRecommendations = false
+    @State private var recommendationLiveRooms: [String: DYLiveRoom] = [:]
+    @State private var nextLiveGap = 8
+    @State private var recommendationLiveQueue: [DYLiveRoom] = []
+    /// 已经做过「临近准备」（刷新地址 / 暖线路 / 预载封面）的直播间 → 时间
+    @State private var livePreviewPrepared: [String: Date] = [:]
+    private let recommendationLivePrefix = "recommendation:live:"
+
     @StateObject private var live = DYLiveModel()
     @StateObject private var following = DYPagedModelHolder()
     @State private var showSearch = false
@@ -1636,9 +1820,9 @@ struct DouyinFeedScreen: View {
     /// 盖在视频上的页面（我的/信息/搜索/作者）打开时，所有视频和直播都停
     private var overlayOpen: Bool { showSearch || showMine || showMessages || authorTarget != nil }
     /// 半折叠/合屏：顶栏要整体左移躲开前摄挖孔，间距也收紧
-    @State private var topNudge: CGFloat = 0
+
     /// 顶栏可用宽度：评论栏从右侧滑出时 = 视频区宽度，顶栏跟着视频居中、自适应收紧
-    @State private var topBarWidth: CGFloat?
+
     /// A · 经典布局已下线：固定走 B / C。A 的分支代码（各处 immersiveLayout 为 false 的那一半）
     /// 原样留在源码里，只是不再可达；要恢复就把这一行换回
     /// @AppStorage("douyin_immersive_layout_v1") private var immersiveLayout = false，并把设置里的 A 选项放回去。
@@ -1667,62 +1851,49 @@ struct DouyinFeedScreen: View {
 
     var body: some View {
         GeometryReader { safe in
+            let commentsOpen = tab == .recommend ? showComments && current != nil : tab == .follow && showFollowComments
+            let hidesStatus = hSize == .regular && commentsOpen && !overlayOpen && web == nil
+                && DYCommentLayout(size: safe.size, fold: DYDuoMetrics.foldIsActive(safe), showComments: true).sideBySide
+            let panelWidth = sidePanelWidth(safe)
+            let topBarWidth: CGFloat? = panelWidth > 0 ? safe.size.width - panelWidth : nil
+            let topNudge = panelWidth > 0 ? 0 : DYDuoMetrics.topBarLeftShift(safe)
+            let navPlacement = DYNavBarPlacement(safe: safe.safeAreaInsets, compact: hSize == .compact,
+                                                 fullBleed: fullBleed, sidePanelOpen: topBarWidth != nil,
+                                                 immersive: immersiveLayout)
             ZStack(alignment: .top) {
                 layoutRoot
                     .environment(\.dyFeedSafeInsets, safe.safeAreaInsets)
-                if !(tab == .live && (live.clean || live.entered)) && !commentsDocked(safe) {
-                    // B：外屏（右侧系统条）和内屏都用居中顶栏；普通 iPhone 竖屏保持原来的左排
-                    let outerStrip = immersiveLayout && tab != .live
-                        && (hSize != .compact || safe.safeAreaInsets.trailing >= 80)
-                    // B：顶栏右侧让出的宽度与视频区一致（外屏系统条 84pt，不是固定 70），「推荐」才能落在视频正中
-                    // 内屏例外：「推荐」对齐折痕（屏幕正中），顶栏横跨整屏、不让右侧按钮列；
-                    // 侧边评论栏打开时（topBarWidth 有值）仍按视频区居中。
-                    let hingeCentered = outerStrip && fullBleed && topBarWidth == nil
-                    let railReserve: CGFloat = immersiveLayout && tab != .live && !hingeCentered
-                        ? max(hSize == .compact ? 70 : 78, safe.safeAreaInsets.trailing) : 0
-                    // 直播 / 搜索拉到视频区两端做成玻璃圆钮（内屏顶栏横跨整屏，搜索要停在按钮列左侧）
-                    let statusRow = outerStrip && hSize != .compact
-                        && safe.safeAreaInsets.top >= 60 && safe.safeAreaInsets.trailing < 80
-                    // statusRow：搜索停在右上角时间 / 电量那一组的左边（那一组实测占右侧约 122pt）
-                    let edgeTrailing: CGFloat = statusRow ? 144
-                        : (hingeCentered ? max(78, safe.safeAreaInsets.trailing) + 12 : 12)
-                    topBar(centered: outerStrip, inner: fullBleed, edgeTrailing: edgeTrailing)
-                        // B + 外屏：状态栏在右侧系统条里，顶部没有东西要让，顶栏直接贴到顶部安全区
-                        // 内屏竖放：时间 / 电量横排在右上角（顶部安全区 82pt，右侧没有系统条）。
-                        // 顶栏不再排到这条安全区下面，而是和状态栏同一行：状态栏那一组在顶部安全区里上下居中
-                        // 略偏下（真机实测中线距顶约 48pt，安全区 82pt），48pt 高的顶栏按同一条中线放。
-                        .padding(.top, statusRow ? safe.safeAreaInsets.top / 2 - 17
-                                 : max(safe.safeAreaInsets.top,
-                                       immersiveLayout && safe.safeAreaInsets.trailing >= 80 ? 4
-                                       : (hSize == .compact ? 44 : 16)) + 8)
-                        .frame(width: topBarWidth.map { max(0, $0 - railReserve) })
-                        .padding(.trailing, railReserve)
-                        .background {
-                            GeometryReader { bar in
-                                LinearGradient(colors: [.black.opacity(0.62), .black.opacity(0.22), .clear],
-                                               startPoint: .top, endPoint: .bottom)
-                                    .frame(height: bar.size.height + 36)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if !(tab == .live && (displayedLive.clean || displayedLive.entered)) && !commentsDocked(safe) {
+                    // 顶栏整套实现在 Navbar.swift：推荐 / 关注 / 直播共用同一条，位置不随页面变化
+                    DYNavBar(model: navBarModel, placement: navPlacement, inner: fullBleed,
+                             width: topBarWidth, topNudge: topNudge)
                 }
             }
+            .onPreferenceChange(DYTopChromeFrameKey.self) { next in
+                guard abs(next.maxY - topChrome.maxY) > 0.5 || abs(next.minY - topChrome.minY) > 0.5 else { return }
+                topChrome = next
+            }
             .overlayPreferenceValue(DYFoldedRecommendBoundsKey.self) { anchor in
-                // B + 外屏：搜索已经排进居中的顶栏里，不再单独浮一颗
-                if hSize == .compact, let anchor,
-                   !(immersiveLayout && tab != .live && safe.safeAreaInsets.trailing >= 80) {
+                // 外屏紧凑排法：搜索单独浮在前摄旁（居中顶栏里已经自带搜索）
+                if navPlacement.floatingSearch, let anchor {
                     GeometryReader { geo in
-                        foldedSearch(in: geo, safeInsets: safe.safeAreaInsets, recommend: geo[anchor])
+                        DYNavBarFloatingSearch(geo: geo, safeInsets: safe.safeAreaInsets, recommend: geo[anchor]) {
+                            showSearch = true
+                        }
                     }
                 }
             }
+            .statusBarHidden(hidesStatus)
+            .persistentSystemOverlays(hidesStatus ? .hidden : .automatic)
             .ignoresSafeArea(edges: [.top, .horizontal])
+            .coordinateSpace(.named("douduo.feed"))
         }
         // 直播间返回键只保留 DYLiveRoomPage 里那一颗画面内「返回」胶囊：
         // 主视图不挂 NavigationStack / toolbar，避免 Duo 系统侧栏再渲染一个重复的返回按钮。
         .background(DouyinBridgeHost(bridge: bridge).frame(width: 1, height: 1).allowsHitTesting(false))
-        .background(DYForwardPreloadHost(item: current, enabled: !overlayOpen && web == nil))
+        // 分享面板不再在启动时后台预载整页抖音视频页：点「分享」时才加载，关闭即释放
+        // 启动即预取消息 / 朋友 / 私信会话；消息页开着时让出聊天页
+        // 消息不再在启动时后台预读（聊天网页、通知、关注列表）：进消息页时才加载
         .task {
             guard !initialized else { return }
             initialized = true
@@ -1851,11 +2022,14 @@ struct DouyinFeedScreen: View {
             feed.items[index].aiDeclaration = detail.aiDeclaration
             saveSession()
         }
+        .task { await runRecommendationLiveWorker() }
+        .onChange(of: feed.items.map(\.id), initial: true) { _, _ in installRecommendationLive() }
         .onChange(of: currentID) { old, new in
             // ⚠️ 宽屏（Duo 内屏）首次布局时 ScrollView 会把 scrollPosition 回写成 nil → 没有「当前条」→ 全部不播、上滑也不认。
             // 列表非空时把 nil 顶回上一个；刷新 / 重载会先清空列表再置 nil，不受影响。
             if new == nil, let old, feed.items.contains(where: { $0.id == old }) { currentID = old; return }
             scrollID = new
+            if new?.hasPrefix(recommendationLivePrefix) == true { showComments = false }
             if let new, let i = feed.items.firstIndex(where: { $0.id == new }) {
                 // 滑动等待：切到这条时后面已经没有可播的了（下一滑得等供应）
                 DYFeedBench.becameCurrent(new, waited: i + 1 >= feed.items.count)
@@ -1879,7 +2053,11 @@ struct DouyinFeedScreen: View {
             saveSession(sync: true)
             DYFeedBench.dump("resign")
         }
-        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            cacheCurrentForResume()
+        }
+        // 定时只为补存播放进度（换条 / 切后台都会立即存）：整份列表编码写盘，15 秒一次足够
+        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in
             if DDPlayback.shared.appIsActive { saveSession() }
         }
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
@@ -1935,23 +2113,20 @@ struct DouyinFeedScreen: View {
             await bridge.prefetchCommonScreens()
         }
         .task {
-            // 只预取一页直播元数据，不拉流、不进房；用户点直播时不必再从零等列表。
-            guard tab != .live else { return }
-            do { try await Task.sleep(for: .seconds(2)) } catch { return }
-            guard live.rooms.isEmpty, !Task.isCancelled else { return }
+            guard tab == .recommend, !DYFeedBench.isBenchRun else { return }
+            // 直播列表只为「点直播页秒开」备着：等首条视频起播、首屏供应拉完再取，不跟起播抢网络和主线程
+            do { try await Task.sleep(for: .seconds(8)) } catch { return }
+            guard tab == .recommend, live.rooms.isEmpty, !Task.isCancelled else { return }
             await live.load(bridge, reset: true)
-            async let followed: Void = live.loadFollowLive(bridge)
-            await withTaskGroup(of: Void.self) { group in
-                for room in live.rooms.prefix(6) {
-                    if let url = room.cover.flatMap(URL.init(string:)) {
-                        group.addTask { _ = await ImageCache.shared.load(url) }
-                    }
-                }
-            }
-            _ = await followed
+            guard tab == .recommend, !Task.isCancelled else { return }
+            await live.prepareFeaturedEntry(bridge)
         }
-        .onChange(of: showMessages) { _, open in
-            if !open { Task { await refreshNoticeUnread() } }
+        .onChange(of: showMessages || swipeReveal == .messages) { _, open in
+            // 消息页（含侧滑露出一半又取消）一离开就释放聊天网页，不在后台挂着
+            if !open {
+                DYMessageCache.shared.releaseChat()
+                Task { await refreshNoticeUnread() }
+            }
         }
         .task {
             // 启动查一次新版本；关掉后同一版本不再提示
@@ -1971,17 +2146,9 @@ struct DouyinFeedScreen: View {
         }
     }
 
-    @ViewBuilder
     private var layoutRoot: some View {
         GeometryReader { geo in
-            let panelW = sidePanelWidth(geo)
-            // 右侧有评论栏时前摄落在评论栏上，顶栏不用再躲
-            let nudge = panelW > 0 ? 0 : DYDuoMetrics.topBarLeftShift(geo)
-            let barW: CGFloat? = panelW > 0 ? geo.size.width - panelW : nil
             flatArrangement(geo)
-                .onAppear { topNudge = nudge; topBarWidth = barW }
-                .onChange(of: nudge) { _, n in topNudge = n }
-                .onChange(of: barW) { _, v in withAnimation(.snappy) { topBarWidth = v } }
         }
     }
 
@@ -2024,6 +2191,7 @@ struct DouyinFeedScreen: View {
                                      showComments: showComments && tab == .recommend)
         let w = geo.size.width, h = geo.size.height
         let sideBySide = layout.sideBySide
+        let stableViewport = immersiveLayout || sideBySide
         let tableFold = layout.tableFold
         let showPanel = layout.showPanel
         let panelW = layout.panelWidth, panelH = layout.panelHeight
@@ -2033,13 +2201,13 @@ struct DouyinFeedScreen: View {
             // 外屏：评论面板从底部升起，视频缩到上方继续播（关注流在 DYFollowFeed 里自己挂）
             DYCommentDock(panelID: current?.id, enabled: layout.docked && tab == .recommend && current != nil, isOpen: $showComments) {
                 feedArea
-                    // B keeps the paging/player viewport stable while comments animate.
+                    // Keep the paging/player viewport stable while side comments animate.
                     // Scale the existing presentation instead of repeatedly refitting 9:16 media.
-                    .frame(width: immersiveLayout ? w : videoW,
-                           height: immersiveLayout ? h : videoH, alignment: .topLeading)
-                    .scaleEffect(immersiveLayout ? min(videoW / max(w, 1), videoH / max(h, 1)) : 1)
+                    .frame(width: stableViewport ? w : videoW,
+                           height: stableViewport ? h : videoH, alignment: .topLeading)
+                    .scaleEffect(stableViewport ? min(videoW / max(w, 1), videoH / max(h, 1)) : 1)
                     .frame(width: videoW, height: videoH,
-                           alignment: immersiveLayout ? .center : .topLeading)
+                           alignment: stableViewport ? .center : .topLeading)
                     // B：视频占满整高时，裁剪框向下放开到屏幕底边，底部安全区不再露出一条黑带
                     .clipShape(DYBottomBleedClip(extra: immersiveLayout && videoH >= h ? geo.safeAreaInsets.bottom : 0))
             } panel: {
@@ -2056,6 +2224,7 @@ struct DouyinFeedScreen: View {
                            height: tableFold ? panelH : h)
                     .offset(x: sideBySide ? videoW : 0, y: tableFold ? videoH : 0)
                     .id(cur.id)
+                    .transition(sideBySide && !fold ? .opacity : .identity)
             }
         }
         .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
@@ -2085,6 +2254,19 @@ struct DouyinFeedScreen: View {
         }
     }
 
+    /// 退到后台：把当前这条整条缓存，下次启动恢复会话时第一条直接读本地起播。
+    /// 系统给后台任务的时间有限，下不完就算了（下次启动照常在线播放）。
+    private func cacheCurrentForResume() {
+        guard !DYFeedBench.isBenchRun, let item = current, item.images.isEmpty else { return }
+        let app = UIApplication.shared
+        let task = DYBackgroundTaskBox()
+        task.id = app.beginBackgroundTask(withName: "douduo.resume-cache") { task.end() }
+        Task {
+            await DYVideoCache.shared.cacheForResume(item)
+            task.end()
+        }
+    }
+
     private func saveSession(sync: Bool = false) {
         guard !DYFeedBench.isBenchRun, let id = currentID, feed.items.contains(where: { $0.id == id }) else { return }
         var positions = resume.map
@@ -2098,7 +2280,10 @@ struct DouyinFeedScreen: View {
     private func playNext(after id: String) {
         guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
         if i + 1 < feed.items.count {
-            withAnimation { currentID = feed.items[i + 1].id }
+            withAnimation {
+                currentID = recommendationLiveRoom(after: id).map { recommendationLivePrefix + $0.id }
+                    ?? feed.items[i + 1].id
+            }
         } else {
             Task {
                 await feed.loadMore(bridge)
@@ -2126,6 +2311,8 @@ struct DouyinFeedScreen: View {
     /// 要换一批推荐走「更多 → 刷新推荐」。
     private func selectTab(_ target: DYTab) {
         guard tab != target else { return }
+        liveEntryStartedAt = target == .live && !enteredLiveFromRecommendations && !live.entered
+            ? ProcessInfo.processInfo.systemUptime : nil
         // 关注 ↔ 推荐：两页并排横向滑动交接；直播等其它切换直接换
         if tab == .recommend, target == .follow {
             slide(reveal: .follow, direction: 1) { tab = .follow }
@@ -2198,6 +2385,8 @@ struct DouyinFeedScreen: View {
             return
         }
         let fresh = feed.items
+        recommendationLiveRooms = [:]
+        nextLiveGap = 8
         showComments = false
         preloader.clear()
         resume.map = [:]
@@ -2208,33 +2397,42 @@ struct DouyinFeedScreen: View {
         DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-")")
     }
 
-    private func focusCurrent() {
-        guard !refreshing, let i = currentIndex else { return }
-        preloader.update(feed.items, current: i)
-        let curID = feed.items[i].id
-        let ahead = Array(feed.items.dropFirst(i + 1))
-        let currentItem = feed.items[i]
-        Task {
-            await DYVideoCache.shared.markWatched(curID)
-            await DYVideoCache.shared.focus(current: currentItem, ahead: ahead)
+    private var liveAnchorIndex: Int? {
+        guard let currentID, currentID.hasPrefix(recommendationLivePrefix) else { return nil }
+        return feed.items.firstIndex {
+            recommendationLiveRoom(after: $0.id).map { recommendationLivePrefix + $0.id } == currentID
         }
-        // Forward Buffer 不够就从共享候选池补；待播（列表 + 池）少于 8 条时管线在后台补到 20 条
-        feed.supply(bridge, current: curID)
     }
 
-    /// 后台补充往播放列表里加了新条目：刷新预加载（最多 3 个 AVPlayer）/ 磁盘缓存窗口
+    private func focusCurrent() {
+        guard !refreshing, let index = currentIndex ?? liveAnchorIndex else { return }
+        refreshWindows()
+        let anchorID = feed.items[index].id
+        if currentIndex != nil {
+            Task { await DYVideoCache.shared.markWatched(anchorID) }
+        }
+        feed.supply(bridge, current: anchorID)
+        prepareUpcomingLivePreviews()
+    }
+
     private func refreshWindows() {
-        guard !refreshing, let j = currentIndex else { return }
-        preloader.update(feed.items, current: j)
-        let cur = feed.items[j], ahead = Array(feed.items.dropFirst(j + 1))
-        Task { await DYVideoCache.shared.focus(current: cur, ahead: ahead) }
+        guard !refreshing, let index = currentIndex ?? liveAnchorIndex else { return }
+        preloader.update(feed.items, current: index)
+        // 在播这条 + 预加载窗口由播放器在线流式播放；离线缓存只下窗口之后的，避免同一条视频下载两遍
+        let ahead = Array(feed.items.dropFirst(index + 1))
+        Task { await DYVideoCache.shared.focus(ahead: ahead, skip: DYPreloader.ahead) }
     }
 
     @ViewBuilder
     private var feedArea: some View {
         ZStack(alignment: .top) {
             if tab == .live {
-                DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) }, active: web == nil && !overlayOpen)
+                DYLiveFeed(bridge: bridge, model: displayedLive, onWeb: { u in web = DYWebTarget(url: u) }, active: web == nil && !overlayOpen,
+                           topChrome: topChrome, screenInsets: insets, entryStartedAt: liveEntryStartedAt,
+                           onLeaveRoom: {
+                               displayedLive.leaveRoom()
+                               if enteredLiveFromRecommendations { selectTab(.recommend) }
+                           })
             }
             // 关注 / 推荐各自独立挂载：横滑时相邻那一页预先挂在屏幕外，切完后还是同一个实例
             if tab == .follow || (tab == .recommend && swipeReveal == .follow) {
@@ -2281,7 +2479,10 @@ struct DouyinFeedScreen: View {
         }
         .onChange(of: tab) { _, t in
             if t == .recommend { focusCurrent() } else { preloader.clear() }
-            if t != .live { live.stop() }
+            if t != .live {
+                enteredLiveFromRecommendations = false
+                live.stop()
+            }
         }
         .fullScreenCover(isPresented: $showSearch) {
             DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author })
@@ -2299,290 +2500,15 @@ struct DouyinFeedScreen: View {
 
     }
 
-    /// 外屏独立使用紧凑导航；内屏保持原样：关注/推荐/直播、消息、头像、搜索 紧凑排成一组。
-    /// 两种布局都在状态栏下方，并为右侧前摄预留空间。
-    private func topBar(centered: Bool, inner: Bool, edgeTrailing: CGFloat) -> some View {
-        Group {
-            if centered {
-                centeredTopBar(pinRecommend: inner, edgeLeading: hSize != .compact ? 20 : 12, edgeTrailing: edgeTrailing)
-            } else if hSize == .compact || (immersiveLayout && tab != .live) {
-                compactTopBar
-            } else {
-                ViewThatFits(in: .horizontal) {
-                    topBarRow(spacing: topNudge > 0 ? 5 : 14, hPad: 16)
-                    topBarRow(spacing: 0, hPad: 10)
-                    topBarRow(spacing: 0, hPad: 5)
-                }
-            }
-        }
-        .themeShadow(.mediaLabel)
-        .frame(maxWidth: .infinity, minHeight: 48)
-        // 居中顶栏不躲前摄：两侧内容离屏幕右上角很远，偏移只会把「推荐」带离中线
-        .padding(.trailing, centered ? 0 : topNudge)
-    }
-
-    /// 外屏按内容宽度从左排列。44pt 点击区已贡献文字两侧留白，
-    /// 再加 6pt 统一间距，常规字号下文字的可见间距约 16pt。
-    private var compactTopBar: some View {
-        ViewThatFits(in: .horizontal) {
-            compactTopBarRow(spacing: 6)
-                .fixedSize(horizontal: true, vertical: false)
-            compactTopBarRow(spacing: 2)
-                .fixedSize(horizontal: true, vertical: false)
-            // 极窄窗口保留全部入口，横向滚动而不压缩、重叠文字。
-            ScrollView(.horizontal) {
-                compactTopBarRow(spacing: 2)
-            }
-            .scrollIndicators(.hidden)
-            .scrollBounceBehavior(.basedOnSize)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .buttonStyle(.plain)
-        .foregroundStyle(.white)
-        .padding(.horizontal, 8)
-    }
-
-    /// B（外屏 / 内屏）：直播、搜索是两端的玻璃圆钮，中间一组文字 Tab。
-    /// pinRecommend（内屏）：两侧等宽弹性占位，「推荐」钉在折痕上；
-    /// 否则（外屏）四个 Tab 整组居中，整条顶栏左右对称。
-    private func centeredTopBar(pinRecommend: Bool, edgeLeading: CGFloat, edgeTrailing: CGFloat) -> some View {
-        ZStack {
-            HStack(alignment: .center, spacing: 6) {
-                HStack(spacing: 6) {
-                    compactEntry("我的", selected: false, id: "douyin.mine.top") { showMine = true }
-                    compactEntry(DYTab.follow.title, selected: tab == .follow, id: "douyin.tab.follow") { selectTab(.follow) }
-                }
-                .frame(maxWidth: pinRecommend ? .infinity : nil, alignment: .trailing)
-                compactRecommendEntry
-                compactEntry("消息", selected: false, dot: noticeUnread > 0, id: "douyin.messages.top") { setMessages(true) }
-                    .frame(maxWidth: pinRecommend ? .infinity : nil, alignment: .leading)
-            }
-            HStack(spacing: 0) {
-                compactLiveButton(inGlass: true).ddGlassCapsule(clear: pinRecommend)
-                Spacer(minLength: 0)
-                compactSearchButton.ddGlassCapsule(clear: pinRecommend)
-            }
-            .padding(.leading, edgeLeading)
-            .padding(.trailing, edgeTrailing)
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.white)
-    }
-
-    private var compactSearchButton: some View {
-        Button { showSearch = true } label: {
-            Image(systemName: "magnifyingglass")
-                .resizable().scaledToFit()
-                .fontWeight(.semibold)
-                .frame(width: 20, height: 20)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
-        }
-        .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
-    }
-
-    /// inGlass：玻璃圆钮里的图标缩到和搜索图标（20pt）视觉等大
-    private func compactLiveButton(inGlass: Bool = false) -> some View {
-        Button { selectTab(.live) } label: {
-            Image(systemName: "play.tv")
-                .resizable().scaledToFit()
-                .frame(width: inGlass ? 23 : 32, height: inGlass ? 18 : 24)
-                .foregroundStyle(.white.opacity(tab == .live ? 1 : 0.9))
-                .frame(width: 44, height: 44)
-                .overlay(alignment: .bottom) {
-                    Capsule().fill(.white).frame(width: 18, height: 2.5)
-                        .opacity(tab == .live ? 1 : 0)
-                }
-                .contentShape(Rectangle())
-        }
-        .accessibilityLabel("直播").accessibilityIdentifier("douyin.tab.live")
-    }
-
-    private var compactRecommendEntry: some View {
-        compactEntry(DYTab.recommend.title, selected: tab == .recommend, loading: refreshing, id: "douyin.tab.recommend") {
-            selectTab(.recommend)
-        }
-        .simultaneousGesture(TapGesture(count: 2).onEnded {
-            selectTab(.recommend); Task { await refreshRecommendations() }
-        })
-    }
-
-    private func compactTopBarRow(spacing: CGFloat) -> some View {
-        HStack(alignment: .center, spacing: spacing) {
-            compactLiveButton()
-
-            compactEntry("我的", selected: false, id: "douyin.mine.top") { showMine = true }
-            compactEntry("消息", selected: false, dot: noticeUnread > 0, id: "douyin.messages.top") { setMessages(true) }
-            compactEntry(DYTab.follow.title, selected: tab == .follow, id: "douyin.tab.follow") { selectTab(.follow) }
-            compactRecommendEntry
-            .anchorPreference(key: DYFoldedRecommendBoundsKey.self, value: .bounds) { $0 }
-
-            // 仅保留旧按钮的布局占位，保证 ViewThatFits 的间距选择和所有 Tab 位置不变。
-            if immersiveLayout && hSize != .compact {
-                Button { showSearch = true } label: {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 20, weight: .semibold))
-                        .frame(width: 44, height: 44)
-                }
-                .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
-            } else {
-                Color.clear.frame(width: 44, height: 44)
-                    .allowsHitTesting(false).accessibilityHidden(true)
-            }
-        }
-    }
-
-    private func foldedSearch(in geo: GeometryProxy, safeInsets: EdgeInsets, recommend: CGRect) -> some View {
-        let profile = DYFoldedNavigationProfile()
-        let safe = EdgeInsets(top: max(safeInsets.top, geo.safeAreaInsets.top),
-                              leading: max(safeInsets.leading, geo.safeAreaInsets.leading),
-                              bottom: max(safeInsets.bottom, geo.safeAreaInsets.bottom),
-                              trailing: max(safeInsets.trailing, geo.safeAreaInsets.trailing))
-        let camera = foldedCameraRegion(in: geo) ?? profile.fallbackCamera(in: geo.size, safe: safe)
-        let frame = profile.searchFrame(size: geo.size, safe: safe, camera: camera, recommend: recommend)
-        return Group {
-            if let frame {
-                Button { showSearch = true } label: {
-                    Image(systemName: "magnifyingglass")
-                        .resizable().scaledToFit()
-                        // 跟顶栏 17pt 文字视觉等高；点击区仍是 44pt
-                        .fontWeight(.semibold)
-                        .frame(width: 20, height: 20)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .themeShadow(.mediaLabel)
-                .accessibilityLabel("搜索").accessibilityIdentifier("douyin.search")
-                .position(x: frame.midX, y: frame.midY)
-            }
-        }
-    }
-
-    private func foldedCameraRegion(in geo: GeometryProxy) -> CGRect? {
-        guard #available(iOS 27.1, *) else { return nil }
-        var camera: CGRect?
-        for region in geo.reservedRegions(kind: .occlusion) where region.isActive {
-            let frame = region.frame
-            guard frame.width > 1, frame.height > 1,
-                  frame.minY < 140, frame.minX > geo.size.width * 0.5 else { continue }
-            camera = camera.map { $0.union(frame) } ?? frame
-        }
-        return camera
-    }
-
-    private func compactEntry(_ title: String, selected: Bool, dot: Bool = false, loading: Bool = false,
-                              id: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 17, weight: selected ? .bold : .semibold))
-                .lineLimit(1).fixedSize()
-                .opacity(loading ? 0 : 1)
-                .overlay { if loading { ProgressView().tint(.white) } }
-                .overlay(alignment: .topTrailing) {
-                    if dot { Circle().fill(.red).frame(width: 7, height: 7).offset(x: 6, y: -2) }
-                }
-                .foregroundStyle(.white.opacity(selected ? 1 : 0.72))
-                .frame(minWidth: 44, minHeight: 44)
-                .overlay(alignment: .bottom) {
-                    Capsule().fill(.white).frame(width: 22, height: 2.5).opacity(selected ? 1 : 0)
-                }
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier(id)
-    }
-
-    private func topBarRow(spacing: CGFloat, hPad: CGFloat) -> some View {
-        // 触摸区左右各扩 hPad、上下各扩 14（图标与字号不动）
-        HStack(spacing: spacing) {
-            ForEach(DYTab.allCases, id: \.self) { t in
-                Button { selectTab(t) } label: {
-                    VStack(spacing: 3) {
-                        Text(t.title)
-                            .font(.headline.weight(tab == t ? .bold : .medium))
-                            .foregroundStyle(theme.media.onMedia.color(for: scheme).opacity(tab == t ? 1 : 0.62))
-                            .lineLimit(1).fixedSize()
-                            .opacity(t == .recommend && refreshing ? 0 : 1)
-                            .overlay {
-                                if t == .recommend && refreshing {
-                                    ProgressView().tint(theme.media.onMedia.color(for: scheme))
-                                        .accessibilityLabel("正在刷新推荐")
-                                }
-                            }
-                        Capsule()
-                            .fill(theme.media.onMedia.color(for: scheme))
-                            .frame(width: 16, height: 3)
-                            .opacity(tab == t ? 1 : 0)
-                    }
-                    // 文字本身小，撑开触摸区，避免点不中/误判成下拉
-                    .padding(.horizontal, hPad)
-                    .padding(.vertical, 14)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .simultaneousGesture(TapGesture(count: 2).onEnded {
-                    guard t == .recommend else { return }
-                    selectTab(.recommend)
-                    Task { await refreshRecommendations() }
-                })
-            }
-            // 消息只留图标，未读红点仍独立显示。
-            Button { setMessages(true) } label: {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .font(.headline.weight(.medium))
-                    .foregroundStyle(theme.media.onMedia.color(for: scheme).opacity(0.62))
-                .padding(.horizontal, hPad)
-                .padding(.vertical, 14)
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
-                .overlay(alignment: .topTrailing) {
-                    if noticeUnread > 0 {
-                        Circle().fill(theme.status.danger.color(for: scheme))
-                            .frame(width: 7, height: 7)
-                            .offset(x: -(hPad - 2), y: 10)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("消息")
-            .accessibilityIdentifier("douyin.messages.top")
-
-            // 「我的」：独立按钮（不属于 tab 切换）
-            Button { showMine = true } label: {
-                HStack(spacing: 5) {
-                    CachedAsyncImage(url: myUser?.avatar.flatMap(URL.init(string:))) { img in
-                        img.resizable().scaledToFill()
-                    } placeholder: {
-                        Image(systemName: "person.crop.circle")
-                            .font(.system(size: 19))
-                            .foregroundStyle(theme.media.onMedia.color(for: scheme).opacity(0.62))
-                    }
-                    .frame(width: 22, height: 22)
-                    .clipShape(Circle())
-                }
-                .padding(.horizontal, max(hPad - 2, 4))
-                .padding(.vertical, 12)
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("我的")
-            .accessibilityIdentifier("douyin.mine.top")
-            Button { showSearch = true } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.headline.weight(.medium))
-                    .foregroundStyle(theme.media.onMedia.color(for: scheme))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("搜索")
-            .accessibilityIdentifier("douyin.search")
-        }
-        .fixedSize()
+    /// 顶栏的输入：当前页、角标和各入口的动作。顶栏本身在 Navbar.swift。
+    private var navBarModel: DYNavBarModel {
+        DYNavBarModel(tab: tab, refreshing: refreshing, noticeUnread: noticeUnread,
+                      avatar: myUser?.avatar.flatMap(URL.init(string:)),
+                      select: { selectTab($0) },
+                      refreshRecommend: { selectTab(.recommend); Task { await refreshRecommendations() } },
+                      openMine: { showMine = true },
+                      openMessages: { setMessages(true) },
+                      openSearch: { showSearch = true })
     }
 
     private func topIcon(_ name: String, _ id: String, _ act: @escaping () -> Void) -> some View {
@@ -2688,13 +2614,155 @@ struct DouyinFeedScreen: View {
         }
     }
 
+    @MainActor
+    private func runRecommendationLiveWorker() async {
+        guard !DYFeedBench.isBenchRun else { return }
+        var cursor = "0"
+        while !Task.isCancelled {
+            // 队列满或不在推荐页时别每 3 秒醒一次；只有刚补到新房间、队列仍缺时才快速再拉。
+            var delay = 15
+            if tab == .recommend, recommendationLiveQueue.count < 3 {
+                delay = 3
+                do {
+                    let rooms = try await bridge.fetchRecommendationLive(after: cursor)
+                    guard !Task.isCancelled else { return }
+                    cursor = String(Int(Date().timeIntervalSince1970))
+                    var known = Set(recommendationLiveRooms.values.map(\.id))
+                    known.formUnion(recommendationLiveQueue.map(\.id))
+                    let fresh = rooms.filter { !$0.liveStreams.isEmpty && known.insert($0.id).inserted }
+                    recommendationLiveQueue.append(contentsOf: fresh.prefix(3 - recommendationLiveQueue.count))
+                    installRecommendationLive()
+                    if fresh.isEmpty { delay = 15 }
+                } catch {
+                    delay = 15
+                }
+            }
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+        }
+    }
+
+    private func installRecommendationLive() {
+        guard !DYFeedBench.isBenchRun else { return }
+        let ids = feed.items.map(\.id)
+        let validIDs = Set(ids)
+        var placements = recommendationLiveRooms.filter { validIDs.contains($0.key) }
+        let lastAnchor = ids.lastIndex { placements[$0] != nil } ?? -1
+        let currentAnchor = placements.first { recommendationLivePrefix + $0.value.id == currentID }?.key
+        let currentVideoIndex = currentIndex ?? currentAnchor.flatMap { ids.firstIndex(of: $0) } ?? -1
+        var anchorIndex = max(lastAnchor + nextLiveGap, currentVideoIndex + 1)
+        while anchorIndex < ids.count - 1, !recommendationLiveQueue.isEmpty {
+            placements[ids[anchorIndex]] = recommendationLiveQueue.removeFirst()
+            nextLiveGap = Int.random(in: 8...12)
+            anchorIndex += nextLiveGap
+        }
+        recommendationLiveRooms = placements
+        prepareUpcomingLivePreviews()
+    }
+
+    /// 直播卡进入「前方 5 条」就提前准备，不等刷到才开始：
+    /// 1. 重新取一次播放地址——直播间是提前拉好排在 8~12 条之后的，刷到时可能已下播或地址失效，
+    ///    那样每条线路都要等超时才换下一条，这是预览「转很久」的主要来源；已下播的直接撤卡换下一间。
+    /// 2. 暖预览线路（DNS / CDN 回源 / 低清档转码）并预载封面。
+    /// VLC 的静音预播只在直播卡是下一条时开始（机身发热时不预播），那时用的已经是新地址、热线路。
+    private func prepareUpcomingLivePreviews() {
+        guard !DYFeedBench.isBenchRun, tab == .recommend, let index = currentIndex ?? liveAnchorIndex else { return }
+        let now = Date()
+        if livePreviewPrepared.count > 60 {
+            livePreviewPrepared = livePreviewPrepared.filter { now.timeIntervalSince($0.value) < 90 }
+        }
+        for item in feed.items.dropFirst(index).prefix(5) {
+            guard let room = recommendationLiveRooms[item.id] else { continue }
+            if let at = livePreviewPrepared[room.id], now.timeIntervalSince(at) < 90 { continue }
+            livePreviewPrepared[room.id] = now
+            let anchor = item.id
+            let liveID = recommendationLivePrefix + room.id
+            if let cover = room.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(cover) } }
+            DYLiveModel.warmPreview(room)
+            guard !room.webRid.isEmpty else { continue }
+            Task { @MainActor in
+                let started = ProcessInfo.processInfo.systemUptime
+                do {
+                    let refreshed = try await bridge.refreshLivePreview(room)
+                    let ms = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+                    guard recommendationLiveRooms[anchor]?.id == room.id else { return }
+                    if let refreshed {
+                        DYLiveModel.log("DDLIVE_PREVIEW_PREP room=\(room.id) refreshed=1 changed=\(refreshed != room ? 1 : 0) ms=\(ms)")
+                        if refreshed != room {
+                            recommendationLiveRooms[anchor] = refreshed
+                            DYLiveModel.warmPreview(refreshed)
+                        }
+                    } else if currentID != liveID {
+                        // 排队期间已经下播：撤掉这张卡，从队列补下一间
+                        DYLiveModel.log("DDLIVE_PREVIEW_PREP room=\(room.id) ended=1 ms=\(ms)")
+                        recommendationLiveRooms[anchor] = nil
+                        installRecommendationLive()
+                    }
+                } catch {
+                    DYLiveModel.log("DDLIVE_PREVIEW_PREP room=\(room.id) failed ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))")
+                }
+            }
+        }
+    }
+
+    private func recommendationLiveRoom(after id: String) -> DYLiveRoom? {
+        recommendationLiveRooms[id]
+    }
+
+    private func isRecommendationPage(_ id: String) -> Bool {
+        if id.hasPrefix(recommendationLivePrefix) {
+            return recommendationLiveRooms.values.contains {
+                recommendationLivePrefix + $0.id == id
+            }
+        }
+        return feed.items.contains { $0.id == id }
+    }
+
     private var recommendationPager: some View {
-        ScrollView(.vertical) {
+        let canStream = tab == .recommend && web == nil && !overlayOpen
+        let playbackAnchor = liveAnchorIndex.map { feed.items[$0].id } ?? currentIndex.flatMap { index in
+            // Let the first post after a live card keep the audio output to itself.
+            if index > 0, recommendationLiveRoom(after: feed.items[index - 1].id) != nil { return nil }
+            // 静音预播 = 短视频之外再开一路隐藏的直播解码，两路同时解码是发热主因。
+            // 只在直播卡就是下一条、且机身不热时预播；其余情况刷到卡才起播（线路已提前暖过）。
+            guard ProcessInfo.processInfo.thermalState == .nominal else { return nil }
+            let id = feed.items[index].id
+            return recommendationLiveRoom(after: id) != nil ? id : nil
+        }
+        return ScrollView(.vertical) {
             LazyVStack(spacing: 0) {
                 ForEach(feed.items) { item in
                     page(for: item)
                         .containerRelativeFrame([.horizontal, .vertical])
                         .id(item.id)
+                    if let room = recommendationLiveRoom(after: item.id) {
+                        let liveID = recommendationLivePrefix + room.id
+                        DYRecommendationLiveCard(
+                            room: room,
+                            active: canStream && currentID == liveID,
+                            ready: recommendationLivePlayer.ready,
+                            previewError: currentID == liveID ? recommendationLivePlayer.playbackError : nil,
+                            onRetry: {
+                                Task { @MainActor in
+                                    let refreshed = try? await bridge.refreshLivePreview(room)
+                                    guard currentID == liveID, tab == .recommend else { return }
+                                    if let refreshed {
+                                        recommendationLiveRooms[item.id] = refreshed
+                                        recommendationLivePlayer.stop()
+                                        recommendationLivePlayer.play(refreshed)
+                                    } else {
+                                        recommendationLivePlayer.retry()
+                                    }
+                                }
+                            },
+                            onOpen: {
+                                enteredLiveFromRecommendations = true
+                                recommendationLivePlayer.enterFromPreview(room)
+                                selectTab(.live)
+                            }
+                        )
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(liveID)
+                    }
                 }
             }
             .scrollTargetLayout()
@@ -2710,10 +2778,21 @@ struct DouyinFeedScreen: View {
         .onAppear { scrollID = currentID }
         .onDisappear { cancelRecommendationScroll() }
         .onChange(of: scrollID) { _, id in
-            guard let id, feed.items.contains(where: { $0.id == id }) else { return }
+            guard let id, isRecommendationPage(id) else { return }
             if !userScrolling, id != currentID { scrollID = currentID }
         }
         .scrollIndicators(.hidden)
+        .background {
+            if canStream, let anchor = playbackAnchor, let room = recommendationLiveRoom(after: anchor) {
+                let audible = currentID == recommendationLivePrefix + room.id
+                // Mount the VLC drawable independently of the lazy pages.
+                DYRecommendationLivePlayback(room: room, audible: audible, model: recommendationLivePlayer)
+                .id(room.id)
+                .opacity(audible ? 1 : 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(!audible)
+            }
+        }
         .ignoresSafeArea()
     }
 
@@ -2731,11 +2810,46 @@ struct DouyinFeedScreen: View {
     private func commitRecommendationScroll() {
         guard userScrolling else { return }
         cancelRecommendationScroll()
-        guard let id = scrollID, feed.items.contains(where: { $0.id == id }) else {
+        guard let id = scrollID, isRecommendationPage(id) else {
             scrollID = currentID
             return
         }
-        if id != currentID { currentID = id }
+        if id != currentID {
+            let leavingLive = currentID?.hasPrefix(recommendationLivePrefix) == true
+            if leavingLive {
+                recommendationLivePlayer.vlc.onStopped = {
+                    retainRecommendationAudio(afterLiveFor: id)
+                }
+                recommendationLivePlayer.muted = true
+                recommendationLivePlayer.stop()
+            }
+            currentID = id
+            if leavingLive {
+                Task { @MainActor in
+                    do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                    retainRecommendationAudio(afterLiveFor: id)
+                }
+            }
+        }
+    }
+
+    private func retainRecommendationAudio(afterLiveFor id: String) {
+        guard currentID == id, tab == .recommend, !overlayOpen, web == nil,
+              !muted, DDPlayback.shared.appIsActive,
+              let item = feed.items.first(where: { $0.id == id }),
+              (item.images.isEmpty ? item.play != nil : item.imageMusicURL != nil) else { return }
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if session.category != .playback || session.categoryOptions.contains(.mixWithOthers) {
+                try session.setCategory(.playback, mode: .moviePlayback)
+            }
+            try session.setActive(true)
+            DYLiveModel.log("DDAUDIO live handoff id=\(id) otherAudio=\(session.isOtherAudioPlaying)")
+            // 只激活会话不够：VLC 停用会话时 AVPlayer 已被系统暂停，要让当前条接着播
+            DDPlayback.shared.reclaimAudio("live-handoff")
+        } catch {
+            DYLiveModel.log("DDAUDIO live handoff failed id=\(id) error=\(error.localizedDescription)")
+        }
     }
 
     private func cancelRecommendationScroll() {
@@ -3274,12 +3388,22 @@ struct DYVideoPage: View {
                 Button(action: onAuthor) {
                     HStack(spacing: 8) {
                         // 作者名比文案（13pt 常规）大一档并加粗，一眼能和下面的文案分开
-                        Text(item.author.name).font(.callout.weight(.bold)).foregroundStyle(fg).lineLimit(1)
+                        Text(item.author.name.isEmpty || item.author.name.hasPrefix("@") ? item.author.name : "@" + item.author.name)
+                            .font(.callout.weight(.bold)).foregroundStyle(fg).lineLimit(1)
                             .frame(minHeight: 26, alignment: .leading)
                     }
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.author")
+                if onDislike != nil, !item.images.isEmpty {
+                    Label("图文", systemImage: "photo.on.rectangle")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(fg)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(fg.opacity(0.18), in: RoundedRectangle(cornerRadius: 4))
+                        .fixedSize()
+                }
             }
             if !immersiveLayout, let metadata = item.metadataText() {
                 Text(metadata)
@@ -3514,7 +3638,11 @@ struct DYImagePostView: View {
     /// 预加载器提前缓冲好的背景音乐（没有就现建）
     var preparedMusic: () -> AVPlayer? = { nil }
     /// 图片按这个像素上限在后台解码：够铺满手机屏（原图常是 2160×2880，整张懒解码会在翻页动画里卡主线程）
-    static let maxPixel = 2400
+    /// 上限按屏幕算：竖图铺满屏宽时最长边约为短边的 16/9，再大也显示不出来，只多占内存。
+    static let maxPixel: Int = {
+        let s = UIScreen.main.nativeBounds.size
+        return min(2400, max(1280, Int(min(s.width, s.height) * 16 / 9)))
+    }()
     /// 每张停留秒数（单张图没有翻页，停久一点再连播）
     static let slideSeconds: Double = 3
     static let singleSeconds: Double = 5
@@ -3526,13 +3654,16 @@ struct DYImagePostView: View {
 
     private var count: Int { item.images.count }
 
-    /// 把一条图文的所有图片下好并在后台解码进内存缓存（预加载器和当前页共用）
-    static func prefetchImages(_ item: DYAweme) {
-        let urls = item.images.compactMap(URL.init(string:))
+    /// 把一条图文的图片下好并在后台解码进内存缓存（预加载器和当前页共用）。
+    /// 按离 `around` 的远近一张一张来：以前十几张同时解码，CPU 和内存一起顶满，翻页就卡。
+    /// `limit` 非空时只管最近的几张（翻页时用，保证下一张已经解好）。
+    static func prefetchImages(_ item: DYAweme, around: Int = 0, limit: Int? = nil) {
+        let ordered = item.images.enumerated()
+            .sorted { abs($0.offset - around) < abs($1.offset - around) }
+            .compactMap { URL(string: $0.element) }
+        let urls = limit.map { Array(ordered.prefix($0)) } ?? ordered
         Task.detached(priority: .utility) {
-            await withTaskGroup(of: Void.self) { group in
-                for url in urls { group.addTask { _ = await ImageCache.shared.loadThumb(url, maxPixel: maxPixel) } }
-            }
+            for url in urls { _ = await ImageCache.shared.loadThumb(url, maxPixel: maxPixel) }
         }
     }
 
@@ -3551,7 +3682,9 @@ struct DYImagePostView: View {
         .onChange(of: muted) { _, m in music?.isMuted = m }
         .onChange(of: isCurrent) { _, c in c ? startMusic() : stopMusic() }
         .onAppear { if isCurrent { startMusic() } }
-        .onChange(of: isCurrent, initial: true) { _, c in if c { Self.prefetchImages(item) } }   // 冷启动直接落在这条时也补齐
+        .onChange(of: isCurrent, initial: true) { _, c in if c { Self.prefetchImages(item, around: page) } }   // 冷启动直接落在这条时也补齐
+        // 翻页后保证前后几张在内存里（长图文里较远的可能已被缓存淘汰）
+        .onChange(of: page) { _, p in if isCurrent { Self.prefetchImages(item, around: p, limit: 4) } }
         .onDisappear { stopMusic() }
         // 每换一页（自动或手滑）任务重启 → 重新计时；不是当前条就不跑
         .task(id: AdvanceKey(current: isCurrent, page: page)) { await autoAdvance() }
@@ -3674,6 +3807,8 @@ struct DYCommentPanel: View {
     let bridge: DouyinBridge
     let aweme: DYAweme
     let onClose: (() -> Void)?
+    /// 从消息点评论进来：首屏用 insert_ids 把这条评论顶到第一条并高亮
+    let focus: DYCommentFocus?
     @State private var items: [DYComment] = []
     @State private var cursor = 0
     @State private var hasMore = true
@@ -3687,6 +3822,10 @@ struct DYCommentPanel: View {
     @State private var replyErr: [String: String] = [:]
     @State private var draft = ""
     @State private var replyTo: DYComment?
+    /// replyTo 是楼中楼时它所在的一级评论 cid（发送走 reply_id=一级、reply_to_reply_id=这条）
+    @State private var replyParent: String?
+    @State private var highlight: String?
+    @State private var focusMiss = false
     @State private var showEmoji = false
     @State private var showAt = false
     @State private var emojis: [DYEmoji] = []
@@ -3701,8 +3840,9 @@ struct DYCommentPanel: View {
     @State private var relatedQuery: DYRelatedQuery?
     @FocusState private var inputFocused: Bool
 
-    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?) {
+    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, focus: DYCommentFocus? = nil) {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
+        self.focus = focus?.awemeID == aweme.id ? focus : nil
     }
 
     var body: some View {
@@ -3724,13 +3864,19 @@ struct DYCommentPanel: View {
             .foregroundStyle(.themeTextPrimary)
             .padding(.horizontal, 16).padding(.vertical, 12)
             Divider()
+            ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    if focusMiss {
+                        Text("这条评论已删除或暂不可见").font(.caption).foregroundStyle(.themeTextSecondary)
+                            .frame(maxWidth: .infinity)
+                    }
                     ForEach(items) { c in
                         VStack(alignment: .leading, spacing: 10) {
-                            row(c)
-                            if c.replies > 0 { replyBlock(c) }
+                            row(c, parent: nil)
+                            if c.replies > 0 || !(replies[c.id] ?? []).isEmpty { replyBlock(c) }
                         }
+                        .id(c.id)
                     }
                     if let error {
                         Text(error).font(.caption).foregroundStyle(theme.status.danger.color(for: scheme))
@@ -3752,6 +3898,11 @@ struct DYCommentPanel: View {
                 .background(DYCommentScrollPullObserver(callbacks: pullDismiss))
             }
             .accessibilityIdentifier("douyin.comments.list")
+            .onChange(of: highlight) { _, h in
+                guard let h else { return }
+                withAnimation(.snappy) { proxy.scrollTo(h, anchor: .center) }
+            }
+            }
             if !relatedWords.isEmpty {
                 Divider()
                 ScrollView(.horizontal) {
@@ -3805,7 +3956,7 @@ struct DYCommentPanel: View {
                 HStack {
                     Text("回复 @\(r.name)").font(.caption).foregroundStyle(.themeTextSecondary).lineLimit(1)
                     Spacer()
-                    Button { replyTo = nil } label: { Image(systemName: "xmark.circle.fill").font(.caption) }
+                    Button { replyTo = nil; replyParent = nil } label: { Image(systemName: "xmark.circle.fill").font(.caption) }
                         .buttonStyle(.plain).foregroundStyle(.themeTextSecondary)
                 }
             }
@@ -3963,24 +4114,34 @@ struct DYCommentPanel: View {
         sending = true
         defer { sending = false }
         do {
-            let c = try await bridge.publishComment(aweme.id, text: text, replyID: replyTo?.id)
-            if let parent = replyTo {
-                replies[parent.id, default: []].insert(c, at: 0)
+            // 回楼中楼：reply_id 必须是一级评论，被回的那条放 reply_to_reply_id（网页同款）
+            let top = replyParent ?? replyTo?.id
+            let c = try await bridge.publishComment(aweme.id, text: text, replyID: top,
+                                                    replyToReplyID: replyParent == nil ? nil : replyTo?.id)
+            if let top {
+                replies[top, default: []].insert(c, at: 0)
             } else {
                 items.insert(c, at: 0)
                 total += 1
             }
-            draft = ""; replyTo = nil; sendErr = nil
+            draft = ""; replyTo = nil; replyParent = nil; sendErr = nil
             inputFocused = false
         } catch {
             sendErr = "发送失败：\(error.localizedDescription)"
         }
     }
 
-    private func row(_ c: DYComment) -> some View {
+    private func row(_ c: DYComment, parent: String?) -> some View {
         rowBody(c)
             .contentShape(Rectangle())
-            .onTapGesture { replyTo = c; inputFocused = true }
+            .onTapGesture { replyTo = c; replyParent = parent ?? c.parent; inputFocused = true }
+            .padding(highlight == c.id ? 6 : 0)
+            .background {
+                if highlight == c.id {
+                    RoundedRectangle(cornerRadius: 10).fill(theme.accent.color(for: scheme).opacity(0.16))
+                }
+            }
+            .accessibilityIdentifier(highlight == c.id ? "douyin.comment.focused" : "douyin.comment.row")
     }
 
     private func rowBody(_ c: DYComment) -> some View {
@@ -4053,7 +4214,7 @@ struct DYCommentPanel: View {
     private func replyBlock(_ c: DYComment) -> some View {
         let got = replies[c.id] ?? []
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(got) { r in row(r) }
+            ForEach(got) { r in row(r, parent: c.id).id(r.id) }
             if replyErr[c.id] != nil {
                 Button { replyErr[c.id] = nil; Task { await loadReplies(c) } } label: {
                     Text("回复加载失败，点此重试").font(.caption).foregroundStyle(.themeTextSecondary)
@@ -4073,6 +4234,31 @@ struct DYCommentPanel: View {
             }
         }
         .padding(.leading, 42)
+    }
+
+    /// insert_ids 回来后：一级评论已在第一条；楼中楼挂在它的 pinned 里，先塞进回复区再高亮
+    private func applyFocus(_ f: DYCommentFocus, page: [DYComment]) {
+        let top = f.parentCid ?? f.cid
+        var target: String?
+        if let head = page.first(where: { $0.id == top }) {
+            if f.parentCid != nil, let pinned = head.pinned, !pinned.isEmpty {
+                replies[top] = pinned
+                replyMore[top] = head.replies > pinned.count
+            }
+            target = (replies[top] ?? []).contains { $0.id == f.cid } ? f.cid : top
+        }
+        if target == nil || target == top, page.contains(where: { $0.id == f.cid }) { target = f.cid }
+        guard let target else {
+            focusMiss = true
+            DYLiveModel.log("DDFOCUS miss aweme=\(f.awemeID) cid=\(f.cid) parent=\(f.parentCid ?? "-")")
+            return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            highlight = target
+            try? await Task.sleep(for: .seconds(6))
+            withAnimation(.easeOut(duration: 0.8)) { if highlight == target { highlight = nil } }
+        }
     }
 
     private func loadReplies(_ c: DYComment) async {
@@ -4099,12 +4285,15 @@ struct DYCommentPanel: View {
         defer { loading = false }
         do {
             let t0 = DDPerf.ms
-            let r = try await bridge.fetchComments(aweme.id, cursor: cursor)
+            let first = cursor == 0 && items.isEmpty
+            let ins = first ? focus.map { f in [f.parentCid, f.cid].compactMap { $0 }.joined(separator: ",") } : nil
+            let r = try await bridge.fetchComments(aweme.id, cursor: cursor, insert: ins)
             if cursor == 0 { DYLiveModel.log("DDPERF comments.firstPage took \(DDPerf.ms - t0)ms id=\(aweme.id)") }
             try Task.checkCancellation()
             let previousCursor = cursor
             let seen = Set(items.map(\.id))
             items.append(contentsOf: r.items.filter { !seen.contains($0.id) })
+            if let f = focus, first { applyFocus(f, page: r.items) }
             for c in r.items where c.userDigged == 1 { digged.insert(c.id) }
             cursor = r.cursor
             hasMore = r.hasMore && !r.items.isEmpty && r.cursor != previousCursor
@@ -4229,5 +4418,15 @@ struct DYCommentImageViewer: View {
             .accessibilityIdentifier("douyin.comment.viewer.close")
         }
         .onAppear { page = target.start }
+    }
+}
+
+/// 后台任务标识只结束一次（到期回调和下载完成都可能先到）
+@MainActor final class DYBackgroundTaskBox {
+    var id: UIBackgroundTaskIdentifier = .invalid
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }

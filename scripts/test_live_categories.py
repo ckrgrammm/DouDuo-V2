@@ -15,7 +15,7 @@ class LiveCategoryTests(unittest.TestCase):
         swift = "import Foundation\nstruct DYLiveZone { let id: String; let type: String; let name: String }\n"
         swift += SOURCE[start:end]
         swift += '''
-let expected = ["精选", "关注", "游戏", "聊天", "音乐", "二次元", "舞蹈", "文化", "生活", "运动"]
+let expected = ["精选", "游戏", "聊天", "音乐", "二次元", "舞蹈", "文化", "生活", "运动"]
 precondition(ddLiveCategories.map(\\.name) == expected)
 precondition(Set(ddLiveCategories.map(\\.id)).count == expected.count)
 let ids = ["聊天": "101", "音乐": "102", "二次元": "104", "舞蹈": "105", "文化": "106", "生活": "107", "运动": "108"]
@@ -35,7 +35,9 @@ print("Actual category registry passed")
     def test_removed_standalone_game_entry(self):
         self.assertNotIn('Label("游戏专区"', SOURCE)
         self.assertNotIn('.accessibilityIdentifier("live.categories")', SOURCE)
-        self.assertIn('.accessibilityIdentifier("live.discover")', SOURCE)
+        self.assertIn(".accessibilityIdentifier(\"live.discover\")", SOURCE)
+        self.assertNotIn(".init(id: \"followed\", name: \"关注\"", SOURCE)
+        self.assertNotIn("case .followed:", SOURCE)
 
     def test_no_placeholder_or_recommendation_fallback(self):
         self.assertNotIn("case .pending:", SOURCE)

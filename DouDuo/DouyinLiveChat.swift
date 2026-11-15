@@ -16,6 +16,8 @@ final class DYLiveChat: NSObject, ObservableObject, WKNavigationDelegate {
     let web: WKWebView
     private var timer: Timer?
     private var room: String?
+    private var openedAt = ProcessInfo.processInfo.systemUptime
+    private var composerLogged = false
     private var seq = 0
     private var ticks = 0
     private var generation = UUID()
@@ -31,12 +33,31 @@ final class DYLiveChat: NSObject, ObservableObject, WKNavigationDelegate {
         web.customUserAgent = DouyinWeb.userAgent
         super.init()
         web.navigationDelegate = self
+        Self.installLeanRules(on: web)
     }
+
+    /// 评论区只读聊天文字：直播间页面的图片、字体、视频、音频一律不下载。
+    /// 规则编译一次后缓存；编译完成前的第一次加载不受影响，之后的加载都带规则。
+    private static let leanRules = """
+    [{"trigger":{"url-filter":".*","resource-type":["image","font","media"]},"action":{"type":"block"}}]
+    """
+    private static func installLeanRules(on web: WKWebView) {
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "dd-live-chat-lean-v1", encodedContentRuleList: leanRules) { list, _ in
+            guard let list else { return }
+            DispatchQueue.main.async { web.configuration.userContentController.add(list) }
+        }
+    }
+
+    /// 当前已加载（或正在加载）的直播间 webRid。预热过同一间时，进房不用再等一遍。
+    var loadedRoom: String? { room }
 
     func open(_ webRid: String) {
         guard !webRid.isEmpty, webRid != room else { return }
         generation = UUID()
         room = webRid
+        openedAt = ProcessInfo.processInfo.systemUptime
+        composerLogged = false
+        DYLiveModel.log("DDCHAT_OPEN room=\(webRid)")
         composerReady = false
         messages = []
         ticks = 0
@@ -166,6 +187,10 @@ final class DYLiveChat: NSObject, ObservableObject, WKNavigationDelegate {
                   let arr = payload["items"] as? [[String]] else { return }
             let ready = payload["ready"] as? Bool ?? false
             if self.composerReady != ready { DYLiveModel.log("DDCHAT composerReady=\(ready)") }
+            if ready, !self.composerLogged {
+                self.composerLogged = true
+                DYLiveModel.log("DDCHAT_COMPOSER_READY elapsed=\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime - self.openedAt))")
+            }
             self.composerReady = ready
             if self.ticks % 10 == 1 {
                 DYLiveModel.log("DDCHAT tick=\(self.ticks) new=\(arr.count) first=\(arr.first?.joined(separator: "：") ?? "-")")

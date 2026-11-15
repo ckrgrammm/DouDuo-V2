@@ -10,17 +10,43 @@ import CoreImage
 /// 当前绑着锁屏控件的播放页 id（空 = 没绑）
 @MainActor enum DDRemoteOwner { static var id = "" }
 
+enum DDPlaybackPauseReason: Equatable {
+    case inactive
+    case background
+    case cover
+}
+
 final class DDPlayback {
     static let shared = DDPlayback()
     private var stoppers: [UUID: () -> Void] = [:]
     private var starters: [UUID: () -> Void] = [:]
+    private var sessionRetainers: [UUID: () -> Bool] = [:]
     private var lock = NSLock()
     /// App 当前是否在前台：注册晚于切后台时（视频刚起播），要立刻停，不能接着响
     private(set) var appIsActive = true
+    private(set) var pauseReason: DDPlaybackPauseReason = .background
+    /// 转发等覆盖层还盖着。后台锁不能把它清掉，前台回调也不能在它消失前把直播拉起来。
+    private var coverCount = 0
+    var coverHold: Bool { coverCount > 0 }
 
-    func register(_ id: UUID, stop: @escaping () -> Void, start: @escaping () -> Void) {
+    /// 「更多」菜单里的「后台播放」：短视频开了就不因切后台/锁屏停声（听书用）。
+    /// 不跳过直播自己的后台策略。
+    static var bgPlay: Bool { UserDefaults.standard.bool(forKey: "douyin_bg_play_v1") }
+
+    /// 有 VLC 播放器停止（直播预览 / 直播间 / VLC 兜底）后发出。当前短视频收到后把音频会话拿回来并接着播。
+    static let reclaimAudioNotification = Notification.Name("DDPlaybackReclaimAudio")
+    /// VLC 停止时把整个 App 的音频会话停用了（见 VLCPlayerController.mediaPlayerStateChanged）。
+    /// 只在前台、没有覆盖层时请当前短视频接回；切后台、转发面板盖着时不抢。
+    @MainActor func reclaimAudio(_ why: String) {
+        guard appIsActive, coverCount == 0, UIApplication.shared.applicationState == .active else { return }
+        NotificationCenter.default.post(name: Self.reclaimAudioNotification, object: why)
+    }
+
+    func register(_ id: UUID, stop: @escaping () -> Void, start: @escaping () -> Void, retainsAudioSession: (() -> Bool)? = nil) {
         lock.lock(); defer { lock.unlock() }
         stoppers[id] = stop; starters[id] = start
+        if let retainsAudioSession { sessionRetainers[id] = retainsAudioSession }
+        else { sessionRetainers[id] = nil }
         let shouldStop = !appIsActive
         #if DEBUG
         ddWrite("DDBG register \(id.uuidString.prefix(4)) total=\(stoppers.count) appActive=\(appIsActive)")
@@ -29,29 +55,70 @@ final class DDPlayback {
     }
     func unregister(_ id: UUID) {
         lock.lock(); defer { lock.unlock() }
-        stoppers[id] = nil; starters[id] = nil
+        stoppers[id] = nil; starters[id] = nil; sessionRetainers[id] = nil
         #if DEBUG
         ddWrite("DDBG unregister \(id.uuidString.prefix(4)) total=\(stoppers.count)")
         #endif
     }
-    /// 「更多」菜单里的「后台播放」：开了就不因切后台/锁屏停声（听书用）
-    static var bgPlay: Bool { UserDefaults.standard.bool(forKey: "douyin_bg_play_v1") }
-    func pauseAll() {
-        if Self.bgPlay { return }
-        appIsActive = false
-        lock.lock(); let s = Array(stoppers.values); lock.unlock()
+    /// 控制中心、通知横幅这类失焦。短视频暂停；不把 App 标成后台，直播的停止留到真正的 background。
+    func pauseForInactivity() {
+        guard appIsActive else { return }
+        lock.lock()
+        let stops = Array(stoppers.values)
+        lock.unlock()
+        let previous = pauseReason
+        pauseReason = .inactive
+        stops.forEach { $0() }
+        if pauseReason == .inactive { pauseReason = previous }
+    }
+    func pauseAll(reason: DDPlaybackPauseReason = .background) {
+        if reason == .cover { coverCount += 1 }
+        let backgroundWhileCover = reason == .background && !appIsActive && coverCount > 0
+        if !backgroundWhileCover {
+            guard DYLivePlaybackGate.apply(appIsActive: appIsActive, command: .pause) else {
+                if reason == .cover { coverCount = max(0, coverCount - 1) }
+                return
+            }
+            appIsActive = false
+        }
+        pauseReason = reason
+        lock.lock()
+        let stops = Array(stoppers.values)
+        let retainers = Array(sessionRetainers.values)
+        lock.unlock()
         #if DEBUG
-        ddWrite("DDBG pauseAll count=\(s.count)")
+        let label = reason == .background ? "background" : (reason == .cover ? "cover" : "inactive")
+        ddWrite("DDBG pauseAll count=\(stops.count) reason=\(label)")
         #endif
-        s.forEach { $0() }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        stops.forEach { $0() }
+        let keepSession = Self.bgPlay || retainers.contains { $0() }
+        if !keepSession {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
     func resumeAll() {
+        guard DYLivePlaybackGate.apply(appIsActive: appIsActive, command: .resume) else { return }
         appIsActive = true
+        guard coverCount == 0 else { return }
+        startRegisteredPlayers()
+    }
+    /// 覆盖层消失。还在后台时只减计数；人已经回到前台才启动。
+    func releaseCover() {
+        guard coverCount > 0 else { return }
+        coverCount -= 1
+        guard coverCount == 0, UIApplication.shared.applicationState == .active else { return }
+        appIsActive = true
+        startRegisteredPlayers()
+    }
+    private func startRegisteredPlayers() {
         lock.lock(); let s = Array(starters.values); lock.unlock()
         #if DEBUG
         ddWrite("DDBG resumeAll count=\(s.count)")
         #endif
+        if !s.isEmpty {
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
+        }
         s.forEach { $0() }
     }
 }
@@ -454,6 +521,17 @@ struct PlayerPage: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             resumeAfterBackground()
         }
+        .onReceive(NotificationCenter.default.publisher(for: DDPlayback.reclaimAudioNotification)) { note in
+            reclaimAudioAfterVLCStop(note.object as? String ?? "-")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
+            guard isActive, isPlaying, DDPlayback.shared.appIsActive,
+                  let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  type == AVAudioSession.InterruptionType.ended.rawValue,
+                  let options = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
+                  AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume) else { return }
+            resumeAfterBackground()
+        }
         .onChange(of: muted) { _, m in
             guard isActive else { return }
             player?.isMuted = m
@@ -722,8 +800,12 @@ struct PlayerPage: View {
         gen.requestedTimeToleranceAfter = CMTime(seconds: 1.5, preferredTimescale: 600)
         imgGen = gen
         attachObservers(p)
-        if let r = resumePosition, r > 1 { p.seek(to: CMTime(seconds: r, preferredTimescale: 600)) }
-        if isActive, shouldFastStart(p) {
+        let continuesPreparedPlayback = pre != nil && p.currentTime().seconds > 0
+        if let r = resumePosition, r.isFinite, r > 0,
+           !continuesPreparedPlayback || abs(p.currentTime().seconds - r) > 0.05 {
+            p.seek(to: CMTime(seconds: r, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        if isActive, !continuesPreparedPlayback, shouldFastStart(p) {
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
             startFast(hd: p)
@@ -928,6 +1010,13 @@ struct PlayerPage: View {
     /// 起播看门狗：当前屏 6 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
     private func watchdog(_ p: AVPlayer) {
         logAudio(p)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard isActive, isPlaying, player === p, !seeking, vlc == nil,
+                  DDPlayback.shared.appIsActive, p.timeControlStatus == .paused,
+                  p.currentItem?.status == .readyToPlay else { return }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            p.play()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
             let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
@@ -976,10 +1065,27 @@ struct PlayerPage: View {
         #if DEBUG
         ddWrite("DDBG pauseForBackground id=\(id) vlc=\(vlc != nil) av=\(player != nil) rate=\(player?.rate ?? -9) t=\(String(format: "%.1f", player?.currentTime().seconds ?? -1)) active=\(isActive)")
         #endif
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // 音频会话的交还统一由 DDPlayback.pauseAll 决定（直播开着「后台播放」时要留住会话）
     }
 
     /// 回到前台：还是当前条就接着播
+    /// 当前条本该在播（isPlaying 是我们的意图，系统暂停不会改它）却被 VLC 停用会话打断：
+    /// 重新激活会话（后台音乐随之再次让出）并接着播。用户自己暂停的、不在当前屏的都不动。
+    private func reclaimAudioAfterVLCStop(_ why: String) {
+        guard isActive, isPlaying, !seeking else { return }
+        let session = AVAudioSession.sharedInstance()
+        if session.category != .playback || session.categoryOptions.contains(.mixWithOthers) {
+            try? session.setCategory(.playback, mode: .moviePlayback)
+        }
+        try? session.setActive(true)
+        if let v = vlc {
+            if !v.mediaPlayer.isPlaying { v.mediaPlayer.play() }
+        } else if let p = player, p.timeControlStatus == .paused {
+            p.play()
+            DYLiveModel.log("DDAUDIO reclaim \(why) id=\(id) resumed=1 otherAudio=\(session.isOtherAudioPlaying)")
+        }
+    }
+
     private func resumeAfterBackground() {
         #if DEBUG
         ddWrite("DDBG resumeAfterBackground id=\(id) active=\(isActive) av=\(player != nil) t=\(String(format: "%.1f", player?.currentTime().seconds ?? -1))")

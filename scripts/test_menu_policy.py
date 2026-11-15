@@ -14,6 +14,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FEED = (ROOT / "DouDuo/DouyinFeedView.swift").read_text()
 EXTRAS = (ROOT / "DouDuo/DouyinExtras.swift").read_text()
+# 顶栏已抽到 Navbar.swift
+NAVBAR = (ROOT / "DouDuo/Navbar.swift").read_text()
 
 
 def block(source, marker):
@@ -43,7 +45,7 @@ class MenuPolicyTests(unittest.TestCase):
             self.assertNotIn(token, FEED)
 
     def test_top_bar_icons_and_hit_targets(self):
-        top = block(FEED, "private func topBarRow")
+        top = block(NAVBAR, "private func topBarRow")
         self.assertIn("ForEach(DYTab.allCases", top)
         tabs = block(FEED, "enum DYTab:")
         for title in ("关注", "推荐", "直播"):
@@ -52,7 +54,7 @@ class MenuPolicyTests(unittest.TestCase):
         self.assertNotIn("myUser?.name", top)
         self.assertNotIn("showName", top)
         self.assertIn('Image(systemName: "bubble.left.and.bubble.right")', top)
-        self.assertIn("noticeUnread > 0", top)
+        self.assertIn("model.noticeUnread > 0", top)
         self.assertIn("theme.status.danger", top)
         self.assertEqual(top.count(".frame(minWidth: 44, minHeight: 44)"), 2)
 
