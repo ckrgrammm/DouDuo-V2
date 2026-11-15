@@ -1828,6 +1828,7 @@ struct DouyinFeedScreen: View {
     /// 应用内私信提醒（上游 1.5.2，默认关）；打开后刷视频时也在后台预热私信
     @AppStorage(DYDMNotificationSettings.notifyKey) private var dmNotifications = false
     @AppStorage(DYDMNotificationSettings.detailKey) private var dmDetail = false
+    @AppStorage(DYCommentKeyboard.autoFocusKey) private var replyAutoKeyboard = true
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
@@ -3137,6 +3138,10 @@ struct DouyinFeedScreen: View {
                         .accessibilityIdentifier("settings.dm.detail")
                 } label: { Label("消息", systemImage: "bubble.left.and.bubble.right") }
                 Menu {
+                    Toggle(isOn: $replyAutoKeyboard) { Label("点评论回复时自动弹出键盘", systemImage: "keyboard") }
+                        .accessibilityIdentifier("douyin.comment.autoKeyboard")
+                } label: { Label("评论", systemImage: "text.bubble") }
+                Menu {
                     Button("官网 / 登录（备用入口）", systemImage: "safari") { web = DYWebTarget(url: DouyinWeb.home) }
                 } label: { Label("账号与登录", systemImage: "person.crop.circle") }
                 Menu {
@@ -3942,6 +3947,11 @@ struct DYCommentPanel: View {
     @State private var relatedWords: [String] = []
     @State private var relatedQuery: DYRelatedQuery?
     @FocusState private var inputFocused: Bool
+    /// 评论区位置记忆（上游 1.5.2）：当前屏幕最上面那条一级评论（关掉再开时滚回这里）
+    @State private var topVisibleID: String?
+    @State private var restoredFromMemory = false
+    /// 设置里的开关：点评论 / 名字回复时是否自动弹出键盘（关掉后只进入「回复 @某人」，点输入框才弹）
+    @AppStorage(DYCommentKeyboard.autoFocusKey) private var replyAutoKeyboard = true
 
     init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, focus: DYCommentFocus? = nil) {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
@@ -3997,10 +4007,16 @@ struct DYCommentPanel: View {
                         Text("还没有评论").font(.footnote).foregroundStyle(.themeTextSecondary).frame(maxWidth: .infinity)
                     }
                 }
+                .scrollTargetLayout()   // 评论位置记忆要知道哪条在屏幕最上面
                 .padding(16)
                 .background(DYCommentScrollPullObserver(callbacks: pullDismiss))
             }
             .accessibilityIdentifier("douyin.comments.list")
+            .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID))
+            .onAppear { restoreCommentPosition(proxy) }
+            // 往下拖列表收键盘；关了「自动弹键盘」时点列表空白处也收
+            .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(TapGesture().onEnded { if inputFocused, !replyAutoKeyboard { inputFocused = false } })
             .onChange(of: highlight) { _, h in
                 guard let h else { return }
                 withAnimation(.snappy) { proxy.scrollTo(h, anchor: .center) }
@@ -4050,6 +4066,23 @@ struct DYCommentPanel: View {
         .fullScreenCover(item: $relatedQuery) { query in
             DYRelatedSearchScreen(bridge: bridge, word: query.word)
         }
+        .onDisappear { saveCommentPosition() }
+    }
+
+    /// 关掉评论区：把已加载的评论、楼中楼和当前位置存下，同一条视频再打开时原样恢复
+    private func saveCommentPosition() {
+        guard focus == nil, !items.isEmpty else { return }
+        DYCommentMemory.shared.put(aweme.id, .init(
+            items: items, cursor: cursor, hasMore: hasMore, total: total,
+            replies: replies, replyCursor: replyCursor, replyMore: replyMore,
+            digged: digged, diggShown: diggShown, topID: topVisibleID))
+        DYLiveModel.log("DDCOMMENTMEM save aweme=\(aweme.id.suffix(6)) n=\(items.count) top=\(topVisibleID?.suffix(6) ?? "-")")
+    }
+
+    /// 打开评论区：有记忆就滚回上次看到的那条（不带动画，打开即在原位）
+    private func restoreCommentPosition(_ proxy: ScrollViewProxy) {
+        guard restoredFromMemory, let id = topVisibleID, items.contains(where: { $0.id == id }) else { return }
+        DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) }
     }
 
     private var inputBar: some View {
@@ -4059,7 +4092,7 @@ struct DYCommentPanel: View {
                 HStack {
                     Text("回复 @\(r.name)").font(.caption).foregroundStyle(.themeTextSecondary).lineLimit(1)
                     Spacer()
-                    Button { replyTo = nil; replyParent = nil } label: { Image(systemName: "xmark.circle.fill").font(.caption) }
+                    Button { replyTo = nil; replyParent = nil; inputFocused = false } label: { Image(systemName: "xmark.circle.fill").font(.caption) }
                         .buttonStyle(.plain).foregroundStyle(.themeTextSecondary)
                 }
             }
@@ -4093,6 +4126,15 @@ struct DYCommentPanel: View {
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(Capsule().fill(Color.primary.opacity(0.08)))
                     .accessibilityIdentifier("douyin.comment.input")
+                if inputFocused {
+                    Button { inputFocused = false } label: {
+                        Image(systemName: "keyboard.chevron.compact.down").font(.body)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.themeTextSecondary)
+                    .accessibilityLabel("收起键盘")
+                    .accessibilityIdentifier("douyin.comment.dismissKeyboard")
+                }
                 Button { Task { await send() } } label: {
                     if sending { ProgressView().controlSize(.small) }
                     else { Image(systemName: "paperplane.fill").font(.body.weight(.semibold)) }
@@ -4237,7 +4279,11 @@ struct DYCommentPanel: View {
     private func row(_ c: DYComment, parent: String?) -> some View {
         rowBody(c)
             .contentShape(Rectangle())
-            .onTapGesture { replyTo = c; replyParent = parent ?? c.parent; inputFocused = true }
+            .onTapGesture {
+                if inputFocused, replyTo?.id == c.id { inputFocused = false; return }   // 再点同一条 = 收键盘
+                replyTo = c; replyParent = parent ?? c.parent
+                if replyAutoKeyboard { inputFocused = true }
+            }
             .padding(highlight == c.id ? 6 : 0)
             .background {
                 if highlight == c.id {
@@ -4383,6 +4429,16 @@ struct DYCommentPanel: View {
     }
 
     private func load() async {
+        if items.isEmpty, focus == nil, !restoredFromMemory, let m = DYCommentMemory.shared.take(aweme.id) {
+            // 关掉再开：直接用上次加载好的评论和楼中楼，不重新拉
+            restoredFromMemory = true
+            items = m.items; cursor = m.cursor; hasMore = m.hasMore; total = m.total
+            replies = m.replies; replyCursor = m.replyCursor; replyMore = m.replyMore
+            digged = m.digged; diggShown = m.diggShown
+            topVisibleID = m.topID
+            DYLiveModel.log("DDCOMMENTMEM restore aweme=\(aweme.id.suffix(6)) n=\(m.items.count) top=\(m.topID?.suffix(6) ?? "-")")
+            return
+        }
         guard !loading, hasMore else { return }
         loading = true
         defer { loading = false }
@@ -4531,5 +4587,52 @@ struct DYCommentImageViewer: View {
         guard id != .invalid else { return }
         UIApplication.shared.endBackgroundTask(id)
         id = .invalid
+    }
+}
+
+
+/// 评论键盘相关的设置键（上游 1.5.2）
+enum DYCommentKeyboard {
+    static let autoFocusKey = "douyin_comment_reply_autokeyboard_v1"
+}
+
+/// 评论区位置记忆（上游 1.5.2；内存里，按视频 id，最多记 20 条视频）。
+/// 关掉评论区再打开：不重新加载，评论、展开的楼中楼、点赞状态原样恢复，并滚回上次看到的那条。
+@MainActor
+final class DYCommentMemory {
+    static let shared = DYCommentMemory()
+    struct Entry {
+        var items: [DYComment]; var cursor: Int; var hasMore: Bool; var total: Int
+        var replies: [String: [DYComment]]; var replyCursor: [String: Int]; var replyMore: [String: Bool]
+        var digged: Set<String>; var diggShown: [String: Int]
+        var topID: String?
+    }
+    private var store: [String: Entry] = [:]
+    private var order: [String] = []
+    private let limit = 20
+
+    func put(_ id: String, _ e: Entry) {
+        store[id] = e
+        order.removeAll { $0 == id }; order.append(id)
+        while order.count > limit { store[order.removeFirst()] = nil }
+    }
+    /// 取出不删：同一条视频反复开关都能恢复
+    func take(_ id: String) -> Entry? { store[id] }
+}
+
+/// 跟踪评论列表里「当前最上面那条」一级评论
+struct DYCommentTopTracker: ViewModifier {
+    let ids: [String]
+    @Binding var top: String?
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { visible in
+                // 可见集合按列表顺序取第一个，就是屏幕最上面那条
+                let set = Set(visible)
+                if let first = ids.first(where: { set.contains($0) }) { top = first }
+            }
+        } else {
+            content
+        }
     }
 }
