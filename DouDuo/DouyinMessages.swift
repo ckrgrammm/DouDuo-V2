@@ -2545,8 +2545,10 @@ struct DYForwardScreen: View {
         .sheet(isPresented: $showOtherApps) { DYForwardSystemShare(url: item.webURL) }
         .task { await restorePeople() }
         // 分享浮层不暂停视频：缓存模型持有同一个只读官网上下文，下次打开无需重建SDK/重新拉整份朋友。
+        // 关面板时不再释放（以前每次打开都要重载整页抖音 + 安全SDK + 读朋友列表，联系人要等很久）；
+        // 只在系统内存告警时释放，见 DYForwardWebModel.init。
         .onAppear { model.panelVisible = true }
-        .onDisappear { model.panelVisible = false; model.release() }
+        .onDisappear { model.panelVisible = false }
     }
     private func restorePeople() async {
         if model.layoutFixture { accountPrepared = true; return }
@@ -2635,9 +2637,8 @@ struct DYForwardOfficialScreen: View {
     private var bridgeFailed = false
     private var navigationGeneration = UUID()
     private var lastRemoteRefresh: Date?
-    private var preloadTarget: URL?
-    private var lastPreloadAttempt: Date?
     private var opening: Task<Void, Never>?
+    private var memoryObserver: NSObjectProtocol?
     init(nativeOnly: Bool = false) {
         self.nativeOnly = nativeOnly
         #if DEBUG && targetEnvironment(simulator)
@@ -2646,6 +2647,17 @@ struct DYForwardOfficialScreen: View {
         self.layoutFixture = false
         #endif
         super.init()
+        if nativeOnly {
+            // 温上下文常驻，但内存吃紧时让出来：面板没开着、没在发送就释放，下次打开再冷启动
+            memoryObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.panelVisible, self.retainedWeb != nil else { return }
+                    DYLiveModel.log("DDPEOPLE memory warning")
+                    self.release()
+                }
+            }
+        }
         #if DEBUG && targetEnvironment(simulator)
         if layoutFixture {
             contacts = (1...9).map { .init(id: "layout-fixture-\($0)", name: "合成测试\($0)", avatar: nil, kind: $0 == 9 ? 2 : 1) }
@@ -2659,7 +2671,6 @@ struct DYForwardOfficialScreen: View {
             stop(); web?.navigationDelegate = nil; retainedWeb = nil; web = nil
             navigationGeneration = UUID(); accountScope = scope
             readyForSend = false; bridgeFailed = false; sending = false; lastRemoteRefresh = nil; expectedID = ""
-            preloadTarget = nil; lastPreloadAttempt = nil
         }
         let cache = DYPeopleCache.shared
         cache.activate(scope: scope)
@@ -2766,13 +2777,13 @@ struct DYForwardOfficialScreen: View {
     }
 
     func stop() { opening?.cancel(); opening = nil; web?.stopLoading() }
-    /// 分享面板关闭：彻底释放官网上下文，不在后台挂着整页抖音。朋友列表在磁盘缓存里，下次打开先秒显再刷新。
+    /// 释放官网上下文（系统内存告警且面板没开着时）。朋友列表在磁盘缓存里，下次打开先秒显再后台刷新。
     func release() {
         guard !sending else { return }
         stop()
         web?.navigationDelegate = nil; web?.uiDelegate = nil
         web = nil; retainedWeb = nil
-        readyForSend = false; expectedID = ""; preloadTarget = nil
+        readyForSend = false; expectedID = ""
         DYLiveModel.log("DDPEOPLE share page released")
     }
     /// 温启动：网页仍在上一条作品且分享组件已就绪，只做一次差异扫描，不重新加载页面。
