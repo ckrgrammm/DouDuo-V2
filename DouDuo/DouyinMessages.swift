@@ -487,8 +487,8 @@ struct DYMessagesScreen: View {
                             }
                         }
                     }
-                    .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-                    .scrollEdgeEffectHidden(true, for: .all)
+                    .ddHideNavigationBarBackground()
+                    .ddHideScrollEdgeEffect()
                     .toolbar {
                         // The message center is a root tab. Only its detail pages go back.
                         if !navigation.hasDetail {
@@ -525,7 +525,7 @@ struct DYMessagesScreen: View {
                     ProgressView()
                     Text("正在打开“\(forwardedShare.contact.name)”")
                 }
-                .padding(24).glassEffect(.regular, in: .rect(cornerRadius: 20))
+                .padding(24).ddGlass(in: .rect(cornerRadius: 20))
             }
         }
         .alert("暂未打开会话", isPresented: $shareOpenFailed) {
@@ -1245,7 +1245,7 @@ struct DYMessagesScreen: View {
                 .listRowBackground(Color.clear)
             }
             .listStyle(.plain)
-            .scrollEdgeEffectHidden(true, for: .all)
+            .ddHideScrollEdgeEffect()
             .scrollContentBackground(.hidden)
             .scrollIndicators(.hidden)
             .accessibilityIdentifier("douyin.messages.list")

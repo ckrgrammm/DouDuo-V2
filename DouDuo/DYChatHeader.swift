@@ -16,7 +16,7 @@ struct DYChatHeader: View {
         }
         .frame(maxWidth: maximumWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: true)
-        .glassEffect(onProfile == nil ? .regular : .regular.interactive(), in: .capsule)
+        .ddGlass(in: .capsule, interactive: onProfile != nil)
         .accessibilityIdentifier("douyin.messages.chat.header")
     }
 

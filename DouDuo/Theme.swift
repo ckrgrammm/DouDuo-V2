@@ -80,6 +80,33 @@ extension ShapeStyle where Self == Color {
     static var themeTextSecondary: Color { .secondary }
 }
 
+// MARK: - 液态玻璃底（任意形状）：iOS 26+ glassEffect；低版本回退 ultraThinMaterial
+
+extension View {
+    /// 上游聊天界面（顶栏 / 输入框）用的玻璃底；工程最低支持 iOS 17，低版本退回磨砂材质
+    @ViewBuilder
+    func ddGlass<S: Shape>(in shape: S, interactive: Bool = false) -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
+        } else {
+            self.background(.ultraThinMaterial, in: shape)
+        }
+    }
+
+    /// 隐藏滚动边缘效果（iOS 26+ 才有；低版本本来就没有这层效果）
+    @ViewBuilder
+    func ddHideScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) { self.scrollEdgeEffectHidden(true, for: .all) } else { self }
+    }
+
+    /// 透明导航栏背景（iOS 18+ API；iOS 17 用旧的 toolbarBackground）
+    @ViewBuilder
+    func ddHideNavigationBarBackground() -> some View {
+        if #available(iOS 18.0, *) { self.toolbarBackgroundVisibility(.hidden, for: .navigationBar) }
+        else { self.toolbarBackground(.hidden, for: .navigationBar) }
+    }
+}
+
 // MARK: - 液态玻璃圆按钮（iOS 26+ glassEffect；低版本回退 ultraThinMaterial 圆底）
 
 extension View {

@@ -14,7 +14,7 @@ struct DYChatComposer: View {
                 }
                     .font(.footnote)
                     .padding(.horizontal, 14).padding(.vertical, 8)
-                    .glassEffect(.regular, in: .capsule)
+                    .ddGlass(in: .capsule)
                     .accessibilityIdentifier("douyin.messages.composer.error")
             }
             HStack(spacing: 0) {
@@ -36,7 +36,7 @@ struct DYChatComposer: View {
             }
             .padding(.trailing, 8)
             .frame(minHeight: 44)
-            .glassEffect(.regular, in: .capsule)
+            .ddGlass(in: .capsule)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { model.height = $0 }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("douyin.messages.composer")
